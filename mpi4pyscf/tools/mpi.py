@@ -802,6 +802,7 @@ def _distribute_call(module, name, reg_procs, args, kwargs):
     if module is None:  # Master process
         fn = name
     else:
+        # print("module dirs =", dir(importlib.import_module(module)))
         fn = getattr(importlib.import_module(module), name)
         if dev is None:
             pass
@@ -836,6 +837,7 @@ if rank == 0:
                     # A direct call if worker is not in pending mode
                     return f(dev, *args, **kwargs)
                 else:
+                    # print("Call distribute call at parallel_call")
                     return pool.apply(_distribute_call, (None, f, dev, args, kwargs),
                                       (f.__module__, f.__name__, _dev_for_worker(dev),
                                        _update_args(args, skip_args),
@@ -893,6 +895,7 @@ if rank == 0:
                 if pool.size <= 1 or pool.worker_status == 'R':
                     return f(dev, *args, **kwargs)
                 else:
+                    # print("Call distribute call at reduced_yield")
                     return pool.apply(_distribute_call,
                                       (None, _merge_yield(f), dev, args, kwargs),
                                       (f.__module__, f.__name__, _dev_for_worker(dev),
@@ -926,6 +929,7 @@ else:
 
 def _reduce_call(module, name, reg_procs, args, kwargs):
     from mpi4pyscf.tools import mpi
+    # print("Call distribute call at _reduce_call")
     result = mpi._distribute_call(module, name, reg_procs, args, kwargs)
     return mpi.reduce(result)
 if rank == 0:

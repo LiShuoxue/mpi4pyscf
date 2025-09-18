@@ -1048,7 +1048,7 @@ def _make_eris_outcore(mycc, mo_coeff=None):
             dat = ao2mo._ao2mo.nr_e2(buf[:nrow], mo_coeff, (0,nmo,0,nmo),
                                      's4', 's1', out=outbuf, ao_loc=ao_loc)
             save_vir_frac(i0, i1, dat)
-    buf = buf_prefecth = outbuf = None
+    buf = buf_prefetch = outbuf = None
 
     cput1 = log.timer_debug1('transforming oppp', *cput1)
     log.timer('CCSD integral transformation', *cput0)

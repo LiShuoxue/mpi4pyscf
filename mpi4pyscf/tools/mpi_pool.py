@@ -107,7 +107,11 @@ class MPIPool(object):
                 self.function = types.FunctionType(code, globals())
 
             else:  # message are function args
+                if self.debug:
+                    print("Function is neither close nor function wrapper.")
+                # print("Worker {0} got task {1}.".format(self.rank, task))
                 self.worker_status = 'R'
+                # print("Function that calls =", self.function)
                 ans = self.function(*task)  # task = worker_args
                 if isinstance(ans, types.GeneratorType):
                     print('\nWARNING\n  Function {0} returns generator {1}.\n'
@@ -137,6 +141,7 @@ class MPIPool(object):
 
         # Send all the tasks off and wait for them to be received.
         self.comm.bcast(worker_args)
+        # print('Master: worker_args', worker_args)
 
         result = function(*master_args)
         self.worker_status = 'P'

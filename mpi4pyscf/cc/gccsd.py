@@ -19,7 +19,7 @@
 #
 
 """
-MPI-GCCSD with real intergals.
+MPI-GCCSD with real integrals.
 
 Usage: mpirun -np 2 python gccsd.py
 """
