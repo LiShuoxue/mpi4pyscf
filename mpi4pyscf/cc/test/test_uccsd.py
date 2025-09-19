@@ -1,8 +1,11 @@
 import numpy as np
 import h5py
+import pytest
 
 from mpi4pyscf.tools import mpi
 from pyscf import gto, lib
+from pyscf.cc import uccsd as pyscf_uccsd
+
 from libdmet.solver.scf import UIHF
 from libdmet.solver.cc_solver import UICCSD
 from mpi4pyscf.cc.uccsd import UICCSD as UICCSD_MPI
@@ -47,6 +50,8 @@ def get_full_eris_mat(eris, key):
 
 
 def test_uiccsd_eris(mf: UIHF):
+    if rank == 0:
+        print("Testing UCCSD integrals ...")
     cc_mpi = UICCSD_MPI(mf).set(verbose=5)
     res = testfuncs.test_uiccsd_eris(cc_mpi)
     eris_ref = None
@@ -56,11 +61,13 @@ def test_uiccsd_eris(mf: UIHF):
             full_key = seg_key.replace('x', 'v').replace('X', 'V')
             arr_ref = get_full_eris_mat(eris_ref, full_key)
             diff = np.abs(res[full_key] - arr_ref).max()
-            print (f"{full_key} (seg: {seg_key}) difference: {diff}")
+            print (f"{full_key} (seg: {seg_key}) difference: {diff} / {np.linalg.norm(arr_ref)}")
             assert np.allclose(diff, 0.0)
 
 
 def test_init_amps(mf: UIHF):
+    if rank == 0:
+        print("Testing UCCSD initial amplitudes ...")
     cc_mpi = UICCSD_MPI(mf).set(verbose=4)
     res = testfuncs.test_init_amps(cc_mpi)
     if rank == 0:
@@ -71,10 +78,71 @@ def test_init_amps(mf: UIHF):
                          t2aa=t2aa_ref, t2ab=t2ab_ref, t2bb=t2bb_ref)
         for k in res:
             diff = np.abs(res[k] - res_dict[k]).max()
-            print(f"Difference of {k}: {diff}")
+            print(f"Difference of {k}: {diff} / {np.linalg.norm(res[k])}")
             assert np.allclose(diff, 0.0)
+
+
+def test_make_tau(mf: UIHF):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    if rank == 0:
+        print("Testing UCCSD tau amplitudes ...")
+    res = testfuncs.test_make_tau(cc_mpi)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        taus_ref = pyscf_uccsd.make_tau(t2_ref, t1_ref, t1_ref)
+        keys = ('tauaa', 'taubb', 'tauab')
+        ref = {k: taus_ref[i] for i, k in enumerate(keys)}
+        print("Tau results:")
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            assert np.allclose(diff, 0.0)
+
+
+def test_add_vvvv(mf: UIHF):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    if rank == 0:
+        print("Testing UCCSD add_vvvv ...")
+    res = testfuncs.test_add_vvvv(cc_mpi)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        oovvs_ref = pyscf_uccsd._add_vvvv(cc_ref, t1_ref, t2_ref, eris=eris)
+        keys = ('oovv_aa', 'oovv_ab', 'oovv_bb')
+        ref = {k: oovvs_ref[i] for i, k in enumerate(keys)}
+        print("oovv results:")
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            assert np.allclose(diff, 0.0)
+
+
+def test_update_amps(mf: UIHF):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    res = testfuncs.test_update_amps(cc_mpi)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris)
+        ref = dict(t1a=t1_ref[0], t1b=t1_ref[1],
+                         t2aa=t2_ref[0], t2ab=t2_ref[1], t2bb=t2_ref[2])
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            assert np.allclose(diff, 0.0), f"In test_update_amps, {k} failed."
 
 
 if __name__ == "__main__":
     mf = get_scf_solver()
+
     test_uiccsd_eris(mf)
+    test_init_amps(mf)
+    test_make_tau(mf)
+    test_add_vvvv(mf)
+    test_update_amps(mf)

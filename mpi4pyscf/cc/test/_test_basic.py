@@ -175,20 +175,27 @@ def test_segarray_cls(dev, fname: str):
 
     t_ACBB = _fn_getseg('t_ACBB', seg_idx=1)
     t_ABBB = _fn_getseg('t_ABBB', seg_idx=1)
-    t_ABC = _fn_getseg('t_ABC', seg_idx=1)
+    t_ABC  = _fn_getseg('t_ABC', seg_idx=1)
 
-    res_1 = SegArray(np.zeros((nvir_segC, dim_B)), seg_idx=0, seg_spin='C')
-    res_2 = SegArray(np.zeros((dim_C, nvir_segB)), seg_idx=1, seg_spin='C')
-    res_3 = SegArray(np.zeros((dim_A, nvir_segB, dim_B, dim_B)), seg_idx=1, seg_spin='B')
-    res_4 = SegArray(np.zeros((dim_C, nvir_segB, dim_B)), seg_idx=1, seg_spin='B')
-    res_5 = SegArray(np.zeros((dim_C, dim_B)), seg_idx=None, seg_spin=None)
-    res_6 = SegArray(np.zeros((dim_A, dim_B)), seg_idx=None, seg_spin=None)
+    res_1  = _einsum("acDE,aBDE->cB", t_ACBB, t_ABBB)                           # [c],[B]->[c]B
 
-    res_1 += _einsum("acDE,aBDE->cB", t_ACBB, t_ABBB, out=res_1)
-    res_2 += _einsum("acDE,aBDE->cB", t_ACBB, t_ABBB, out=res_2)
-    res_3 += _einsum("aBc,acDE->aBDE", t_ABC, t_ACBB)
-    res_4 += _einsum("ABc,ADBE->cDE", t_ABC, t_ABBB)
-    res_5 += _einsum("ABc,ABDE->cD", t_ABC, t_ABBB)
-    res_6 += _einsum("acBD,aBc->aD", t_ACBB, t_ABC)
+    res_2  = SegArray(np.zeros((dim_C, nvir_segB)), seg_idx=1, seg_spin='B')
+    res_2 += _einsum("acDE,aBDE->cB", t_ACBB, t_ABBB)                           # [c],[B]->c[B]
+    if rank == 0:
+        print(f"res_2.shape = {res_2.shape}")
 
-    return tuple([x.collect().data for x in (res_1, res_2, res_3, res_4, res_5, res_6)])
+    res_3 = _einsum("aBc,acDE->aBDE", t_ABC, t_ACBB)                            # [B]c,[c]->[B]
+    res_4 = _einsum("ABc,ADBE->cDE", t_ABC, t_ABBB)                             # [B],[D]B->[D]
+    res_5 = _einsum("ABc,ABDE->cD", t_ABC, t_ABBB)                              # [B],[B]->...
+    res_6 = _einsum("acBD,aBc->aD", t_ACBB, t_ABC)                              # [c]B,[B]c->...
+
+    res_7  = SegArray(np.zeros((nvir_segB, dim_B)), seg_idx=0, seg_spin='B')
+    res_7 += _einsum("acDE,acBE->BD", t_ACBB, t_ACBB)                # [c],[c]B->[B]
+
+    res_8 = SegArray(np.zeros((dim_B, dim_B, nvir_segC)), seg_idx=2, seg_spin='C')  # [B]c,[B]->[c]
+    res_8 += _einsum("aBc,aBDE->DEc", t_ABC, t_ABBB) * 2.
+
+    _res_8T = res_8.set(debug=True).transpose(2, 0, 1)
+    res_9 = res_4.set(debug=True) + _res_8T
+
+    return tuple([x.collect().data for x in (res_1, res_2, res_3, res_4, res_5, res_6, res_7, res_8, res_9)])

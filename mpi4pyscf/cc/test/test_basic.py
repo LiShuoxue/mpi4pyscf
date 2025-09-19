@@ -23,16 +23,18 @@ def generate_test_data():
 
 
 def test_segd_einsum_type():
-    from mpi4pyscf.cc.cc_tools import __get_segmented_einsum_type
+    from mpi4pyscf.cc.cc_tools import __get_segmented_einsum_type, SegEinsumType
     def _fn(subscripts, seg_idxs):
         return __get_segmented_einsum_type(subscripts, seg_idxs, debug=True)[0]
 
-    assert _fn("nb,nemj->mbej", seg_idxs=(None, 1)) == 0b100010  # t1, OXOO: general
-    assert _fn("ac,bc->ab", seg_idxs=(1, 1)) == 0b000001  # x,x->x
-    assert _fn("nJfB,menf->mBeJ", seg_idxs=(2, 1)) == 0b100111    # t2_oOxV, oxov: matmul
-    assert _fn("MNAF,MENF->AE", seg_idxs=(2, 1, 0)) == 0b110011       # til_OOXV, OXOV: outer
-    assert _fn("acDE,aBDE->cB", seg_idxs=(1, 1, 1)) == 0b110011   # outer
-    assert _fn("acBD,aBc->aD", seg_idxs=(1, 1)) == 0b001111    # bidot
+    assert _fn("nb,nemj->mbej", seg_idxs=(None, 1)) == SegEinsumType.GENERAL    # ...,[e]->[e]
+    assert _fn("ac,bc->ab", seg_idxs=(1, 1)) == SegEinsumType.GENERAL           # [c],[c]->...
+    assert _fn("nJfB,menf->mBeJ", seg_idxs=(2, 1)) == SegEinsumType.MATMUL      # [f],[e]f->[e]
+    assert _fn("MNAF,MENF->AE", seg_idxs=(2, 1, 0)) == SegEinsumType.OUTER      # [A],[E]->[A]E
+    assert _fn("acDE,aBDE->cB", seg_idxs=(1, 1, 1)) == SegEinsumType.OUTER      # [c],[B]->c[B]
+    assert _fn("acBD,aBc->aD", seg_idxs=(1, 1)) == SegEinsumType.BIDOT          # [c]B,[B]c->...
+    assert _fn("ac,cb->ab", seg_idxs=(1, 0, 0)) == SegEinsumType.NEWAXIS        # a[c],[c]->a
+    assert _fn("ac,cb->ab", seg_idxs=(1, 0, 1)) == SegEinsumType.NEWAXIS        # [c],[c]b->b
     print("All segmented einsum type tests passed!\n")
 
 
@@ -52,15 +54,17 @@ def test_basic_new():
         ref_4 = lib.einsum("ABc,ADBE->cDE", t_ABC, t_ABBB)
         ref_5 = lib.einsum("ABc,ABDE->cD", t_ABC, t_ABBB)
         ref_6 = lib.einsum("acBD,aBc->aD", t_ACBB, t_ABC)
-        refs = (ref_1, ref_2, ref_3, ref_4, ref_5, ref_6)
+        ref_7 = lib.einsum("acDE,acBE->BD", t_ACBB, t_ACBB)
+        ref_8 = lib.einsum("aBc,aBDE->DEc", t_ABC, t_ABBB) * 2.
+        ref_9 = ref_4 + ref_8.transpose(2, 0, 1)
+        refs = (ref_1, ref_2, ref_3, ref_4, ref_5, ref_6, ref_7, ref_8, ref_9)
 
     ress = testfuncs.test_segarray_cls(None, fname)
-
     if rank == 0:
         print("All einsum data generated.\n")
         print("Difference between parallel and serial results:")
         for i, (res, ref) in enumerate(zip(ress, refs)):
-            print(f"max diff of result {i} = ", np.abs(res - ref).max())
+            print(f"max diff of res_{i+1} = ", np.abs(res - ref).max())
             assert np.allclose(res, ref)
 
 

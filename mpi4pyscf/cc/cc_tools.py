@@ -3,7 +3,7 @@ Common MPI tools (einsum, transpose) for coupled-cluster methods.
 
 Author: Shuoxue Li <sli7@caltech.edu>
 """
-
+from collections.abc import Iterable
 from functools import partial
 from enum import IntFlag
 import numpy as np
@@ -17,19 +17,13 @@ rank = mpi.rank
 ntasks = mpi.pool.size
 
 
-KNOWN_SEG_TYPES = dict(
-            general=(0b000000,      # ...,...->...
-                     0b000001,      # x,x->...
-                     0b010001,      # x,...->x; x,x->x
-                     0b100010,      # ...,x->x
-                    ),
-            outer=(0b110011, ),     # x,y->xy
-            matmul = (
-                    0b011011,       # [x]y,[y]->x
-                    0b100111,       # [x],x[y]->y
-                ),
-            bidot=(0b001111, )      # [x],[y]->xys
-        )
+class SegEinsumType(IntFlag):
+    NONE = 0
+    GENERAL = 1
+    OUTER = 2
+    MATMUL = 4
+    BIDOT = 8
+    NEWAXIS = 16
 
 
 def get_vlocs(nvir):
@@ -42,7 +36,8 @@ def collect_array(arr: ArrayLike, seg_idx: int | None = None, debug: bool = Fals
     For the non-segmented array, return the sum for all the processes.
     """
     if seg_idx is None:
-        return mpi.allreduce(arr) if sum_over else arr
+        # allreduce sends 
+        return mpi.reduce(arr) if sum_over else arr
     else:
         ndim = arr.ndim
         tp = (seg_idx, ) + tuple(range(seg_idx)) + tuple(range(seg_idx+1, ndim))
@@ -57,19 +52,19 @@ def get_mpi_array(arr_fn: callable, vlocs: list, seg_idx: int | None = None,
     """
     Get the array that is either non-segmented (seg_idx is None) or segmented by one index.
     """
-    if seg_idx is None: # non-segmented array
+    if seg_idx is None: # non-segmented array, just broadcast it.
         arr = None
         if rank == 0:
-            arr = arr_fn()
+            arr = arr_fn() if callable(arr_fn) else arr_fn
         arr = mpi.bcast(arr, root=0)
         return arr
 
     if rank == 0:
-        arr = arr_fn()
+        arr = arr_fn() if callable(arr_fn) else arr_fn
         segs = [(slice(None), ) * seg_idx + (slice(*x), ) for x in vlocs]
         arr_segs = [arr[slc] for slc in segs]
-        if debug:
-            print(f"In get_mpi_array: {[x.shape for x in arr_segs]}")
+        # if debug:
+            # print(f"In get_mpi_array: {[x.shape for x in arr_segs]}")
     else:
         arr, arr_segs = None, None
     arr_seg = mpi.scatter_new(arr_segs, root=0)
@@ -91,7 +86,7 @@ def resegment(arr: ArrayLike, seg_idx_old: int, seg_idx_new: int, vlocs: list | 
 def __outer_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
                 vlocss: list, seg_idxs_full: tuple, debug: bool = False) -> ArrayLike:
     """
-    Outer product of the two segmented arrays.
+    Outer product of the two segmented arrays: [x],[y]->[x]y or [x],[y]->x[y]
     
     seg_idxs: should have 3 elements, indicating the segmented index of arr1, arr2, and the output array.s
     vlocss: task locations of the two segmented arrays arr1 and arr2.
@@ -133,11 +128,10 @@ def __outer_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
 
 
 def __matmul_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
-                 vlocss: list, seg_idxs_full: tuple, has_idx: int, debug: bool = False) -> ArrayLike:
+                 vlocss: list, seg_idxs_full: tuple, debug: bool = False) -> ArrayLike:
     """
-    [x]y,[y]->x or [y],[x]y->x
+    [x]y,[y]->[x] or [y],[x]y->[x]
     """
-    assert has_idx in (0b011011, 0b100111)
     vlocs1, vlocs2 = vlocss[:2]
     seg_idx12, seg_idx21 = seg_idxs_full[2:4]
 
@@ -146,7 +140,7 @@ def __matmul_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
         # print(f"subscripts = {subscripts}, seg_idx12 = {seg_idx12}, seg_idx21 = {seg_idx21}")
         # print("arr1.shape = {}, arr2.shape = {}".format(arr1.shape, arr2.shape))
 
-    if has_idx == 0b011011:  # xy,y->x
+    if seg_idx21 is not None:  # xy,y->x
         rotate_fn = partial(_rotate_vir_block, vlocs=vlocs2)
         for _, arr2, p0, p1 in rotate_fn(arr2):
             _slc = (slice(None), ) * seg_idx21 + (slice(p0, p1), )
@@ -154,7 +148,7 @@ def __matmul_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
                 # print("slc for arr1 = ", _slc)
             res += lib.einsum(subscripts, arr1[_slc], arr2)
 
-    elif has_idx == 0b100111:   # y,xy->x
+    elif seg_idx12 is not None:   # y,xy->x
         rotate_fn = partial(_rotate_vir_block, vlocs=vlocs1)
         for _, arr1, p0, p1 in rotate_fn(arr1):
             _slc = (slice(None), ) * seg_idx12 + (slice(p0, p1), )
@@ -168,7 +162,7 @@ def __matmul_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
 def __bidot_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
                 vlocss: list, seg_idxs_full: tuple, debug: bool = False) -> ArrayLike:
     """
-    xy,xy->...
+    [x]y,x[y]->...
     Return the array that should be reduced along x axis.
     """
     vlocs1, vlocs2 = vlocss
@@ -184,7 +178,19 @@ def __bidot_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
     return res
 
 
-# def __adjacent_mpi(subsripts: str)
+def __newaxis_mpi(subscripts: str, arr1: ArrayLike, arr2: ArrayLike,
+                  vlocs: list | None, seg_idxs_full: tuple, debug: bool = False):
+    """
+    [x],[x]y->[y] or [x]y,[x]->[y]
+    """
+    assert len(seg_idxs_full) > 6
+    seg_idxf = seg_idxs_full[6]
+    arr = lib.einsum(subscripts, arr1, arr2)
+    arr = collect_array(arr, seg_idx=None)
+    if vlocs is None:
+        nvir_new = arr.shape[seg_idxf]
+        vlocs = get_vlocs(nvir_new)
+    return get_mpi_array(arr_fn=lambda: arr, vlocs=vlocs, seg_idx=seg_idxf, debug=debug)
 
 
 def __get_segmented_einsum_type(subscripts: str, seg_idxs: tuple, debug: bool = False) -> int:
@@ -209,15 +215,35 @@ def __get_segmented_einsum_type(subscripts: str, seg_idxs: tuple, debug: bool = 
     seg_idx21 = None if (seg_str2 is None or not seg_str2 in sub_i1) else sub_i1.index(seg_str2)
     seg_idx1f = None if (seg_str1 is None or not seg_str1 in sub_f) else sub_f.index(seg_str1)
     seg_idx2f = None if (seg_str2 is None or not seg_str2 in sub_f) else sub_f.index(seg_str2)
+    
+    seg_type = SegEinsumType.NONE
+    # get the type of segmented einsum
+    if seg_str1 == seg_str2:
+        if len(seg_idxs) == 3:
+            if sub_f[seg_idxs[2]] != seg_str1:  # output has the different segmented index
+                seg_type = SegEinsumType.NEWAXIS
+            else:
+                seg_type = SegEinsumType.GENERAL
+        else:
+            seg_type = SegEinsumType.GENERAL
+    else:
+        if sum((x is not None) for x in (seg_idx1, seg_idx2)) == 2:
+            match sum((x is not None) for x in (seg_idx12, seg_idx21)):
+                case 0: seg_type = SegEinsumType.OUTER
+                case 1: seg_type = SegEinsumType.MATMUL
+                case 2: seg_type = SegEinsumType.BIDOT
+        else:
+            seg_type = SegEinsumType.GENERAL
 
-    _repr = lambda s: "N" if s is None else s
+    assert seg_type != SegEinsumType.NONE, "The segmented einsum type cannot be NONE."
+
 
     subscripts_prtd = None
     if rank == 0 and debug:
         _fn_prtd = lambda s, i: s[:i] + "[" + s[i] + "]" + s[i+1:] if i is not None else s
         sub_i1_prtd = _fn_prtd(sub_i1, seg_idx1)
         sub_i2_prtd = _fn_prtd(sub_i2, seg_idx2)
-        if len(seg_idxs) == 3:  # outer
+        if len(seg_idxs) == 3:  # outer or newaxis case
             sub_f_prtd = _fn_prtd(sub_f, seg_idxs[2])
         else:
             if seg_idx1f is not None:
@@ -226,38 +252,30 @@ def __get_segmented_einsum_type(subscripts: str, seg_idxs: tuple, debug: bool = 
                 sub_f_prtd = _fn_prtd(sub_f, seg_idx2f)
             else:
                 sub_f_prtd = sub_f
-        subscripts_prtd = f"{sub_i1_prtd}, {sub_i2_prtd} -> {sub_f_prtd}"
-
-    # If the two segmented indices are the same, then the has_idx label should be changeds to avoid conflicts.
-    if seg_str1 == seg_str2:    # x,x->...
-        seg_idx12, seg_idx21, seg_idx2, seg_idx2f = None, None, None, None
+        subscripts_prtd = f"{sub_i1_prtd:<8}, {sub_i2_prtd:<8} -> {sub_f_prtd:<8}"
 
     segs = (seg_idx1, seg_idx2, seg_idx12, seg_idx21, seg_idx1f, seg_idx2f)
-    has_idx = sum((x is not None) << i for i, x in enumerate(segs))
-
-    if rank == 0 and debug:
-        for k, v in KNOWN_SEG_TYPES.items():
-            if has_idx in v:
-                print(f"   {subscripts_prtd:<28} {k:<14} Idxs 1:{_repr(seg_idx1)} 2:{_repr(seg_idx2)} "
-              f"1in2:{_repr(seg_idx12)} 2in1:{_repr(seg_idx21)} 1inf:{_repr(seg_idx1f)} 2inf:{_repr(seg_idx2f)}")
-                break
-
     if len(seg_idxs) >= 3:
         segs += tuple(seg_idxs[2:])
 
+    if rank == 0 and debug:
+        msg = f"   {subscripts_prtd:<32} Type:{seg_type.name:<14}"
+        print(msg)
+
     # the segment index of the output array
-    final_idx = [None, seg_idx1f, seg_idx2f, -1][has_idx >> 4]
+    final_idx = [None, seg_idx1f, seg_idx2f, -1][sum((x is not None) << i for i, x in enumerate((seg_idx1f, seg_idx2f)))]
 
     # When the output array contains all the segmented indices,
     # the final index is either given by the user or the same as seg_idx1f.
-    if final_idx == -1:
-        # assert len(seg_idxs) == 3, "When the output array is segmented by both indices, the seg_idx should be given."
-        if len(seg_idxs) == 3:
-            final_idx = seg_idxs[2]
-        else:
-            final_idx = seg_idx1f
 
-    return has_idx, segs, final_idx
+    if final_idx == -1 and len(seg_idxs) == 2:
+        final_idx = seg_idx1f
+    if len(seg_idxs) == 3:
+        final_idx = seg_idxs[2]
+
+    # if rank == 0 and debug:
+        # print(f"   Final segmented index of output array: {final_idx}\n")
+    return seg_type, segs, final_idx
 
 
 def segmented_einsum_new(subscripts: str, arrs: tuple[ArrayLike, ArrayLike],
@@ -272,26 +290,24 @@ def segmented_einsum_new(subscripts: str, arrs: tuple[ArrayLike, ArrayLike],
             wOvVo -> wOvXo, seg_idx = 2 (X)
             Output arrays should be jNyF,MXNF->MyXj, outer, then merge the index y and return X for each proc.
     """
-    has_idx, seg_idxs_full, final_idx = __get_segmented_einsum_type(subscripts, seg_idxs, debug=debug)
+    seg_type, seg_idxs_full, final_idx = __get_segmented_einsum_type(subscripts, seg_idxs, debug=debug)
     arr1, arr2 = arrs
 
-    seg_type = 'nothing'
-    for k, v in KNOWN_SEG_TYPES.items():
-        if has_idx in v:
-            seg_type = k
-            break
-
-    if seg_type == "general":
+    if seg_type == SegEinsumType.GENERAL:
         res = lib.einsum(subscripts, arr1, arr2)
-    elif seg_type == "outer":
-        res = __outer_mpi(subscripts, arr1, arr2, vlocss, seg_idxs_full, debug=debug)
-    elif seg_type == 'matmul':
-        res = __matmul_mpi(subscripts, arr1, arr2, vlocss, seg_idxs_full, has_idx, debug=debug)
-    elif seg_type == 'bidot':
-        res = __bidot_mpi(subscripts, arr1, arr2, vlocss, seg_idxs_full, debug=debug)
     else:
-        raise NotImplementedError("segmented einsum type %s is not implemented" % seg_type)
+        assert seg_type != SegEinsumType.NONE, "The segmented einsum type cannot be NONE."
 
+        if seg_type == SegEinsumType.NEWAXIS:
+            vlocss = None
+
+        res = {
+            SegEinsumType.OUTER: __outer_mpi,
+            SegEinsumType.MATMUL: __matmul_mpi,
+            SegEinsumType.BIDOT: __bidot_mpi,
+            SegEinsumType.NEWAXIS: __newaxis_mpi,}[seg_type](
+             subscripts, arr1, arr2, vlocss, seg_idxs_full, debug=debug
+         )
     if return_output_idx:
         return res, final_idx
     else:
@@ -361,11 +377,12 @@ class SegArray(lib.StreamObject):
     """
     def __init__(self, data: ArrayLike,
                  seg_idx: int | None = None, seg_spin = None,
-                 label: str = ''):
+                 label: str = '', debug: bool = False):
         self.data = data
         self.seg_idx = seg_idx
         self.seg_spin = seg_spin
         self.label = label
+        self.debug = debug
 
     # define negative operation
     def __neg__(self):
@@ -374,20 +391,50 @@ class SegArray(lib.StreamObject):
     def __add__(self, other):
         _o = other if not isinstance(other, SegArray) else other.data
         if isinstance(other, SegArray):
-            if self.seg_idx != other.seg_idx:
-                # re-segment other to self.seg_idx
-                assert isinstance(self.seg_idx, int) and isinstance(other.seg_idx, int)
-                _o = resegment(_o, seg_idx_old=other.seg_idx, seg_idx_new=self.seg_idx)
-        return SegArray(self.data + _o, self.seg_idx, self.seg_spin, self.label)
+            if self.seg_idx != other.seg_idx: # re-segment other to self.seg_idx
+                if rank == 0 and self.debug:
+                    print(f"In SegArray.__add__: merging different segmented indices\n"
+                          f"self.seg_idx = {self.seg_idx}, other.seg_idx = {other.seg_idx}")
+                has_seg_state = isinstance(self.seg_idx, int) + ((isinstance(other.seg_idx, int)) << 1)
+                match has_seg_state:
+                    case 3: # [self], [other]
+                        _o = resegment(_o, seg_idx_old=other.seg_idx, seg_idx_new=self.seg_idx)
+                    case 2: # self, [other]
+                        _o = collect_array(_o, seg_idx=other.seg_idx)
+                    case 1: # [self], other
+                        _o = collect_array(_o, seg_idx=None)
+                        vlocs = get_vlocs(_o.shape[self.seg_idx])
+                        _o = get_mpi_array(lambda: _o, vlocs=vlocs, seg_idx=self.seg_idx, debug=False)
+                    case _:
+                        raise ValueError("Cannot identify the segmented state of the two arrays.")
+
+        if isinstance(other, SegArray):
+            other_label = other.label if other.label != "" else "unknown"
+            print(f"Rank{rank}: {self.label} {self.data.shape} {other_label} {_o.shape}")
+
+        # When the array does not have segment, just broadcast the added result
+        if self.seg_idx is None:
+            arr_fn = lambda: self.data + _o
+            arr = get_mpi_array(arr_fn=arr_fn, vlocs=None, seg_idx=None, debug=self.debug)
+        else:
+            arr = self.data + _o
+
+        return SegArray(arr, self.seg_idx, self.seg_spin, self.label, self.debug)
 
     def __mul__(self, other):
         _o = other.data if isinstance(other, SegArray) else other
-        return SegArray(self.data * _o, self.seg_idx, self.seg_spin, self.label)
+        return SegArray(self.data * _o, self.seg_idx, self.seg_spin, self.label, self.debug)
 
     __rmul__ = __mul__
 
+    # define subtraction operation
     def __sub__(self, other):
         return self + (-other)
+
+    # define division operation
+    def __truediv__(self, other):
+        _o = other.data if isinstance(other, SegArray) else other
+        return SegArray(self.data / _o, self.seg_idx, self.seg_spin, self.label, self.debug)
 
     def __repr__(self):
         return (f"SegArray({self.label}) <seg_idx={self.seg_idx}, seg_spin={self.seg_spin}>: \n"
@@ -403,10 +450,10 @@ class SegArray(lib.StreamObject):
             return self
         else:
             assert self.seg_idx is None, "Indexing should be used for non-segmented array."
-            return SegArray(data=self.data[key], seg_idx=idxs[0], label=self.label)
+            return SegArray(data=self.data[key], seg_idx=idxs[0], label=self.label, debug=self.debug)
 
     def conj(self):
-        return SegArray(self.data.conj(), self.seg_idx, self.seg_spin, self.label)
+        return SegArray(self.data.conj(), self.seg_idx, self.seg_spin, self.label, self.debug)
 
     def transpose(self, *args):
         if len(args) == 1:
@@ -416,12 +463,14 @@ class SegArray(lib.StreamObject):
         else:
             tp = args
         new_idx = tp.index(self.seg_idx)
-        return SegArray(self.data.transpose(*args), new_idx, self.seg_spin, self.label)
+        if rank == 0 and self.debug:
+            print(f"In SegArray.transpose: old seg_idx = {self.seg_idx}, new seg_idx = {new_idx}, tp = {tp}")
+        return SegArray(self.data.transpose(*args), new_idx, self.seg_spin, self.label, self.debug)
 
     @property
     def shape(self) -> tuple:
         return self.data.shape
 
     def collect(self):
-        return SegArray(collect_array(self.data, self.seg_idx),
-                        seg_idx=None, seg_spin=None, label=self.label)
+        arr = collect_array(self.data, self.seg_idx, debug=self.debug)
+        return SegArray(data=arr, seg_idx=None, seg_spin=None, label=self.label, debug=self.debug)
