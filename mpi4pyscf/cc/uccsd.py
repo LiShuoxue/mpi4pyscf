@@ -1,7 +1,7 @@
 """
 MPI-UCCSD with real integrals.
 """
-from functools import reduce
+from functools import reduce, partial
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -20,6 +20,100 @@ from mpi4pyscf.cc.cc_tools import SegArray
 comm = mpi.comm
 rank = mpi.rank
 ntasks = mpi.pool.size
+
+
+def einsum_sz(subscripts: str, arr1: SegArray, arr2: SegArray,
+              nvira_or_vlocsa: int | list, nvirb_or_vlocsb: int | list,
+              out: SegArray | None = None) -> SegArray:
+    """
+    wrapped einsum function
+    out: the output SegArray to be added on,
+        may be used when segmented einsum type == 'outer',
+        so that the re-segmentation can be avoided.
+    """
+    debug = arr1.debug or arr2.debug
+
+    if isinstance(nvira_or_vlocsa, int):
+        vlocs_a = tools.get_vlocs(nvira_or_vlocsa)
+    else:
+        vlocs_a = nvira_or_vlocsa
+
+    if isinstance(nvirb_or_vlocsb, int):
+        vlocs_b = tools.get_vlocs(nvirb_or_vlocsb)
+    else:
+        vlocs_b = nvirb_or_vlocsb
+
+    def __get_vlocs(arr):
+        if isinstance(arr, SegArray) and arr.seg_spin is not None:
+            return [vlocs_a, vlocs_b][arr.seg_spin]
+        else:
+            return None
+
+    vlocs_1, vlocs_2 = map(__get_vlocs, (arr1, arr2))
+    seg_idxs = (arr1.seg_idx, arr2.seg_idx)
+    if out is not None:
+        seg_idxs += (out.seg_idx, )        
+
+    if rank == 0 and debug:
+        arr1_label = '_tmp' if arr1.label == '' else arr1.label
+        arr2_label = '_tmp' if arr2.label == '' else arr2.label
+        print(f"[uccsd.update_amps] einsum('{subscripts}', {arr1_label}, {arr2_label}) ...")
+    final_data, final_seg_idx = tools.segmented_einsum_new(
+        subscripts=subscripts,
+        arrs=(arr1.data, arr2.data), seg_idxs=seg_idxs,
+        vlocss=(vlocs_1, vlocs_2), return_output_idx=True,
+        debug=debug
+        )
+
+    final_spin = None
+    if out is not None:
+        final_spin = out.seg_spin
+    elif final_seg_idx is not None:
+        # Get the spin of output segmented array from the input arrays.
+        sub_i, sub_f = subscripts.split("->")
+        sub_i1, sub_i2 = sub_i.split(",")
+        seg_idx1, seg_idx2 = seg_idxs[:2]
+        seg_strf = sub_f[final_seg_idx]
+        seg_str1 = None if seg_idx1 is None else sub_i1[seg_idx1]
+        seg_str2 = None if seg_idx2 is None else sub_i2[seg_idx2]
+        if seg_strf == seg_str1:
+            final_spin = arr1.seg_spin
+        elif seg_strf == seg_str2:
+            final_spin = arr2.seg_spin
+
+    return SegArray(final_data, seg_idx=final_seg_idx, seg_spin=final_spin, debug=debug)
+
+
+def transpose_sz(arr: SegArray, idx1: int, idx2: int, coeff_0: float, coeff: float,
+                 nvira_or_vlocsa: int | list, nvirb_or_vlocsb: int | list) -> SegArray:
+    """
+    wrapped transpose function for SegArray of spin label 0/1.
+    """
+    debug = arr.debug
+    if isinstance(nvira_or_vlocsa, int):
+        vlocs_a = tools.get_vlocs(nvira_or_vlocsa)
+    else:
+        vlocs_a = nvira_or_vlocsa
+
+    if isinstance(nvirb_or_vlocsb, int):
+        vlocs_b = tools.get_vlocs(nvirb_or_vlocsb)
+    else:
+        vlocs_b = nvirb_or_vlocsb
+
+    if idx1 != arr.seg_idx and idx2 != arr.seg_idx: # neither idx1 nor idx2 is the seg_idx
+        idxmin, idxmax = min(idx1, idx2), max(idx1, idx2)
+        tp = tuple(range(idxmin)) + (idxmax, ) \
+                + tuple(range(idxmin+1, idxmax)) + (idxmin,) \
+                + tuple(range(idxmax+1, arr.data.ndim))
+        return SegArray(arr.data.transpose(tp) * coeff + arr.data * coeff_0,
+                        arr.seg_idx, arr.seg_spin, arr.label, debug=debug)
+    else:
+        vlocs = vlocs_a if arr.seg_spin == 0 else vlocs_b
+        if idx1 == arr.seg_idx:
+            data = tools.segmented_transpose(arr.data, idx1, idx2, coeff_0, coeff, vlocs=vlocs)
+        elif idx2 == arr.seg_idx:
+            data = tools.segmented_transpose(arr.data, idx2, idx1, coeff_0, coeff, vlocs=vlocs)
+        return SegArray(data, arr.seg_idx, arr.seg_spin, arr.label, debug=debug, reduced=arr.reduced)
 
 
 @mpi.parallel_call(skip_args=[1], skip_kwargs=['eris'])
@@ -49,6 +143,7 @@ def init_amps(mycc, eris=None):
     t1b = fovb.conj() / eia_b
 
     (vloc0a, vloc1a), (vloc0b, vloc1b) = map(_task_location, (nvira, nvirb))
+    slc_va, slc_vb = slice(vloc0a, vloc1a), slice(vloc0b, vloc1b)
 
     vlocsa, vlocsb = map(tools.get_vlocs, (nvira, nvirb))
 
@@ -56,12 +151,15 @@ def init_amps(mycc, eris=None):
 
     # print(f"shapes: {eris_oxov.shape}, {eris_OXOV.shape}, {eris_oxOV.shape}")
 
-    t2_ooxv = eris_oxov.transpose(0, 2, 1, 3) / lib.direct_sum("ix+jb->ijxb", eia_a[:, vloc0a:vloc1a], eia_a)
-    t2_OOXV = eris_OXOV.transpose(0, 2, 1, 3) / lib.direct_sum("iX+JB->iJXB", eia_b[:, vloc0b:vloc1b], eia_b)
-    t2_oOxV = eris_oxOV.transpose(0, 2, 1, 3) / lib.direct_sum("ix+JB->iJxB", eia_a[:, vloc0a:vloc1a], eia_b)
+    t2_ooxv = eris_oxov.transpose(0, 2, 1, 3) / lib.direct_sum("ix+jb->ijxb", eia_a[:, slc_va], eia_a)
+    t2_OOXV = eris_OXOV.transpose(0, 2, 1, 3) / lib.direct_sum("IX+JB->IJXB", eia_b[:, slc_vb], eia_b)
+    t2_oOxV = eris_oxOV.transpose(0, 2, 1, 3) / lib.direct_sum("ix+JB->iJxB", eia_a[:, slc_va], eia_b)
 
     t2_ooxv = tools.segmented_transpose(t2_ooxv, 2, 3, 1., -1., vlocs=vlocsa)
     t2_OOXV = tools.segmented_transpose(t2_OOXV, 2, 3, 1., -1., vlocs=vlocsb)
+
+    assert np.allclose(t2_ooxv, -t2_ooxv.transpose(1, 0, 2, 3))
+    assert np.allclose(t2_OOXV, -t2_OOXV.transpose(1, 0, 2, 3))
 
     emp2 = np.einsum("iJxB,ixJB->", t2_oOxV, eris_oxOV)
     emp2 += np.einsum("ijxb,ixjb->", t2_ooxv, eris_oxov) * .5
@@ -87,9 +185,9 @@ def make_tau_aa(t2_ooxv, t1a, r1a, vlocs, fac=1., out=None):
     return tau1aa
 
 
-def make_tau_ab(t2_oOxV, t1, r1, vlocs, fac=1., out=None):
+def make_tau_ab(t2_oOxV, t1, r1, vlocsa, fac=1., out=None):
     (t1a, t1b), (r1a, r1b) = t1, r1
-    vloc0a, vloc1a = vlocs[rank]
+    vloc0a, vloc1a = vlocsa[rank]
     tau1ab = np.einsum('ix,jb->ijxb', t1a[:, vloc0a:vloc1a], r1b)
     tau1ab += np.einsum('ix,jb->ijxb', r1a[:, vloc0a:vloc1a], t1b)
     tau1ab *= (fac * .5)
@@ -97,7 +195,7 @@ def make_tau_ab(t2_oOxV, t1, r1, vlocs, fac=1., out=None):
     return tau1ab
 
 
-def make_tau(t2, t1, r1, vlocs=None, fac=1., out=None) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
+def make_tau(t2, t1, r1, vlocs=None, fac=1., out=None):
     (t1a, t1b), (r1a, r1b) = t1, r1
     t2_ooxv, t2_oOxV, t2_OOXV = t2
     if vlocs is None:
@@ -106,41 +204,35 @@ def make_tau(t2, t1, r1, vlocs=None, fac=1., out=None) -> tuple[ArrayLike, Array
     else:
         vlocsa, vlocsb = vlocs
 
-    tau_ooxv = make_tau_aa(t2_ooxv, t1a, r1a, vlocsa, fac=fac, out=out)
-    tau_OOXV = make_tau_aa(t2_OOXV, t1b, r1b, vlocsb, fac=fac, out=out)
-    tau_oOxV = make_tau_ab(t2_oOxV, t1, r1, vlocsa, fac=fac, out=out)
+    tau_ooxv = make_tau_aa(t2_ooxv, t1a, r1a, vlocs=vlocsa, fac=fac, out=out)
+    tau_OOXV = make_tau_aa(t2_OOXV, t1b, r1b, vlocs=vlocsb, fac=fac, out=out)
+    tau_oOxV = make_tau_ab(t2_oOxV, t1, r1, vlocsa=vlocsa, fac=fac, out=out)
+
     return tau_ooxv, tau_oOxV, tau_OOXV
 
 
-def _contract_vvvv_t2(h_vxvv, t_ooxv):
-    # currently slow version
-    _einsum = tools.segmented_einsum_new
-    # print(t_ooxv.shape)
-    nocc, nvir_seg, nvir = t_ooxv.shape[1:]
-    nocc_pair = nocc * (nocc + 1) // 2
-    # print(lib.pack_tril(t_ooxv.transpose(2, 3, 0, 1)).shape)
-    t_oxv = lib.pack_tril(t_ooxv.transpose(2, 3, 0, 1).reshape(nvir_seg*nvir, nocc, nocc)).T.reshape(nocc_pair, nvir_seg, nvir)
-    # print(f"h_vxvv.shape = {h_vxvv.shape}, t_oxv.shape = {t_oxv.shape}")
-    res = _einsum("acbd,icd->iab", arrs=(h_vxvv, t_oxv), seg_idxs=(1, 1))
-    res = lib.unpack_tril(res.transpose(1, 2, 0).reshape(nvir*nvir, nocc_pair)).transpose(1, 2, 0).reshape(nocc, nocc, nvir, nvir)
-    # print(res.shape)
-
-
-
-    res = tools.collect_array(res)
-    res = tools.get_mpi_array(res, vlocs=tools.get_vlocs(nvir), seg_idx=2)
+def _contract_vvvv_t2_symm(h, t):
+    """ijcd,acbd->ijab, t, h, but [ij] is one index."""
+    print(t.shape)
+    print(f"|t + t.tp(1, 0, 2, 3)| = {np.linalg.norm(t + t.transpose(1, 0, 2, 3))}")
+    assert np.allclose(t, -t.transpose(1, 0, 2, 3))
+    _, nocc, nvir_seg, nvir = t.shape
+    tril_idx = np.tril_indices(nocc, -1)
+    
+    t_packed = t[tril_idx]  # Icd
+    t_packed = SegArray(t_packed, seg_idx=1, seg_spin=0, label='t')
+    h = SegArray(h, seg_idx=0, seg_spin=0, label='h')
+    # nocc_pair
+    res_packed = einsum_sz('Icd,acbd->Iab', t_packed, h,
+                nvira_or_vlocsa=nvir, nvirb_or_vlocsb=nvir).data # [c],[a]c->[a]
+    res = np.zeros((nocc, nocc, nvir_seg, nvir), dtype=t.dtype)
+    res[tril_idx] += res_packed
+    res = res - res.transpose(1, 0, 2, 3)
     return res
 
-
-def _contract_vvVV_t2(h_vxVV, t_oOxV):
-    _einsum = tools.segmented_einsum_new
-    res = _einsum("ayBD,iJyD->iJaB", arrs=(h_vxVV, t_oOxV), seg_idxs=(1, 2))
-    res = tools.collect_array(res)
-    res = tools.get_mpi_array(res, vlocs=tools.get_vlocs(res.shape[2]), seg_idx=2)
-    return res
-
-
+ 
 def _contract_vvvv_t2_slow(h, t):
+    # TODO: use the symmetry of the unparticipated [vv] indices.
     _einsum = tools.segmented_einsum_new
     nvir_1, nvir_2 = h.shape[1], h.shape[2]
     vlocss = (tools.get_vlocs(nvir_1), tools.get_vlocs(nvir_2))
@@ -154,8 +246,8 @@ def _add_vvvv(t1, t2, eris, vlocs=None):
     else:
         t2_ooxv, t2_oOxV, t2_OOXV = make_tau(t2, t1, t1, vlocs=vlocs)
 
-    u2_ooxv = _contract_vvvv_t2_slow(eris.get_integral("xvvv"), t2_ooxv)
-    u2_OOXV = _contract_vvvv_t2_slow(eris.get_integral("XVVV"), t2_OOXV)
+    u2_ooxv = _contract_vvvv_t2_symm(eris.get_integral("xvvv"), t2_ooxv)
+    u2_OOXV = _contract_vvvv_t2_symm(eris.get_integral("XVVV"), t2_OOXV)
     u2_oOxV = _contract_vvvv_t2_slow(eris.get_integral("xvVV"), t2_oOxV)
     if rank == 0:
         print(u2_ooxv.shape, u2_OOXV.shape, u2_oOxV.shape)
@@ -391,7 +483,7 @@ def _make_eris_incore_uihf(mycc, mo_coeff=None, ao2mofn=None):
     return eris
 
 
-def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[ArrayLike, ArrayLike, ArrayLike]]:
+def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
 
     log = logger.Logger(cc.stdout, cc.verbose)
 
@@ -407,55 +499,8 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
     slc_va, slc_vb = slice(vloc0a, vloc1a), slice(vloc0b, vloc1b)
     dtype = t1a.dtype
 
-    def _fntp(arr: SegArray, idx1: int, idx2: int, coeff_0: float, coeff: float) -> SegArray:
-        """wrapped transpose function for SegArray"""
-        if idx1 != arr.seg_idx and idx2 != arr.seg_idx: # neither idx1 nor idx2 is the seg_idx
-            idxmin, idxmax = min(idx1, idx2), max(idx1, idx2)
-            tp = tuple(range(idxmin)) + (idxmax, ) \
-                    + tuple(range(idxmin+1, idxmax)) + (idxmin,) \
-                    + tuple(range(idxmax+1, arr.data.ndim))
-            return SegArray(arr.data.transpose(tp) * coeff + arr.data * coeff_0, arr.seg_idx, arr.seg_spin)
-        else:
-            vlocs = vlocs_a if arr.seg_spin == 0 else vlocs_b
-            if idx1 == arr.seg_idx:
-                data = tools.segmented_transpose(arr.data, idx1, idx2, coeff_0, coeff, vlocs=vlocs)
-            elif idx2 == arr.seg_idx:
-                data = tools.segmented_transpose(arr.data, idx2, idx1, coeff_0, coeff, vlocs=vlocs)
-            return SegArray(data, arr.seg_idx, arr.seg_spin)
-
-    def _einsum(subscripts: str, arr1: SegArray, arr2: SegArray, out: SegArray | None = None) -> SegArray:
-        """
-        wrapped einsum function
-        out: the output SegArray to be added on,
-            may be used when segmented einsum type == 'outer',
-            so that the re-segmentation can be avoided.
-        """
-        def __get_vlocs(arr):
-            if isinstance(arr, SegArray) and arr.seg_spin is not None:
-                return [vlocs_a, vlocs_b][arr.seg_spin]
-            else:
-                return None
-        vlocs_1, vlocs_2 = map(__get_vlocs, (arr1, arr2))
-
-        seg_idxs = (arr1.seg_idx, arr2.seg_idx)
-        final_spin = None
-
-        if out is not None:
-            seg_idxs += (out.seg_idx, )
-            final_spin = out.seg_spin
-
-        if rank == 0 and debug:
-            arr1_label = '_tmp' if arr1.label == '' else arr1.label
-            arr2_label = '_tmp' if arr2.label == '' else arr2.label
-            print(f"[uccsd.update_amps] einsum('{subscripts}', {arr1_label}, {arr2_label}) ...")
-
-        final_data, final_seg_idx = tools.segmented_einsum_new(
-            subscripts=subscripts,
-            arrs=(arr1.data, arr2.data), seg_idxs=seg_idxs,
-            vlocss=(vlocs_1, vlocs_2), return_output_idx=True,
-            debug=debug
-            )
-        return SegArray(final_data, seg_idx=final_seg_idx, seg_spin=final_spin, debug=debug)
+    _fntp = partial(transpose_sz, nvira_or_vlocsa=nvira, nvirb_or_vlocsb=nvirb)
+    _einsum = partial(einsum_sz, nvira_or_vlocsa=vlocs_a, nvirb_or_vlocsb=vlocs_b)
 
     def _get_integral(key: str) -> SegArray:
         seg_idx, seg_spin = None, None
@@ -464,7 +509,8 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
             if k in key:
                 seg_idx, seg_spin = key.index(k), 'xX'.index(k)
                 break
-        return SegArray(eris.get_integral(key), seg_idx, seg_spin, label=arr_label)
+        reduced = (seg_idx is None)
+        return SegArray(eris.get_integral(key), seg_idx, seg_spin, label=arr_label, debug=debug, reduced=reduced)
 
     mo_ea_o = eris.mo_energy[0][:nocca]
     mo_ea_v = eris.mo_energy[0][nocca:] + cc.level_shift
@@ -473,12 +519,27 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
     fova = eris.focka[:nocca,nocca:]
     fovb = eris.fockb[:noccb,noccb:]
 
+    # non-reduced, non-segmented 1e arrays
     Fooa = np.zeros((nocca, nocca), dtype=dtype)
     Foob = np.zeros((noccb, noccb), dtype=dtype)
     Fvva = np.zeros((nvira, nvira), dtype=dtype)
     Fvvb = np.zeros((nvirb, nvirb), dtype=dtype)
     u1a = np.zeros_like(t1a)
     u1b = np.zeros_like(t1b)
+
+    # reduced 1e arrays
+    Fooa_0 =  .5 * lib.einsum('me,ie->mi', fova, t1a)
+    Foob_0 =  .5 * lib.einsum('me,ie->mi', fovb, t1b)
+    Fvva_0 = -.5 * lib.einsum('me,ma->ae', fova, t1a)
+    Fvvb_0 = -.5 * lib.einsum('me,ma->ae', fovb, t1b)
+    Fooa_0 += eris.focka[:nocca,:nocca] - np.diag(mo_ea_o)
+    Foob_0 += eris.fockb[:noccb,:noccb] - np.diag(mo_eb_o)
+    Fvva_0 += eris.focka[nocca:,nocca:] - np.diag(mo_ea_v)
+    Fvvb_0 += eris.fockb[noccb:,noccb:] - np.diag(mo_eb_v)
+    Fova_0 = fova.copy()
+    Fovb_0 = fovb.copy()
+    u1a_0 = np.zeros_like(t1a)
+    u1b_0 = np.zeros_like(t1b)
 
     taus = make_tau(t2, t1, t1, (vlocs_a, vlocs_b))
     tau_ooxv, tau_oOxV, tau_OOXV = taus
@@ -489,16 +550,25 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
     # Build the segmented array of the intermediates.
 
     ## Transform the broadcaseted 1e arrays to SegArray
-    h1_labels = ('t1a', 't1b', 'u1a', 'u1b', 'Fooa', 'Foob', 'Fvva', 'Fvvb')
-    t1a, t1b, u1a, u1b, Fooa, Foob, Fvva, Fvvb = [SegArray(data=d, label=l, debug=debug)
-        for d, l in zip((t1a, t1b, u1a, u1b, Fooa, Foob, Fvva, Fvvb), h1_labels)]
+    h1_labels = ('t1a', 't1b',
+                 'u1a', 'u1b', 'Fooa', 'Foob', 'Fvva', 'Fvvb',
+                 'u1a_0', 'u1b_0', 'Fooa_0', 'Foob_0', 'Fvva_0', 'Fvvb_0', 'Fova_0', 'Fovb_0')
+    reduced = (True, ) * 2 + (False, ) * 6 + (True, ) * 8
+
+    t1a, t1b, u1a, u1b, Fooa, Foob, Fvva, Fvvb, u1a_0, u1b_0, Fooa_0, Foob_0, Fvva_0, Fvvb_0, Fova_0, Fovb_0 = [
+        SegArray(data=d, label=l, debug=debug, reduced=r)
+        for d, l, r in zip((t1a, t1b, u1a, u1b, Fooa, Foob, Fvva, Fvvb, u1a_0, u1b_0, Fooa_0, Foob_0, Fvva_0, Fvvb_0, Fova_0, Fovb_0),
+        h1_labels, reduced)]
 
     ## Transform the 2e arrays to SegArray
     seg_spins = (0, 0, 1, 0, 0, 1, 0, 0, 1)
-    t2_labels = ('t2aa', 't2ab', 't2ab', 'u2aa', 'u2ab', 'u2ab', 'tau_aa', 'tau_ab', 'tau_bb')
+    t2_labels = ('t2aa', 't2ab', 't2bb', 'u2aa', 'u2ab', 'u2bb', 'tau_aa', 'tau_ab', 'tau_bb')
     t2_ooxv, t2_oOxV, t2_OOXV, u2_ooxv, u2_oOxV, u2_OOXV, tau_ooxv, tau_oOxV, tau_OOXV = [
-        SegArray(data=d, seg_idx=2, seg_spin=ss, label=l, debug=debug) for d, ss, l in zip(
+        SegArray(data=d, seg_idx=2, seg_spin=ss, label=l, debug=debug, reduced=False) for d, ss, l in zip(
             (t2_ooxv, t2_oOxV, t2_OOXV, u2_ooxv, u2_oOxV, u2_OOXV, tau_ooxv, tau_oOxV, tau_OOXV), seg_spins, t2_labels)]
+
+    t1_ox = t1a[:, slc_va].set(seg_spin=0, label='t1_ox')
+    t1_OX = t1b[:, slc_vb].set(seg_spin=1, label='t1_OX')
 
     wovxo = SegArray(np.zeros((nocca, nvira, nvira_seg, nocca), dtype=dtype), seg_idx=2, seg_spin=0, label='wovvo', debug=debug)
     wOVXO = SegArray(np.zeros((noccb, nvirb, nvirb_seg, noccb), dtype=dtype), seg_idx=2, seg_spin=1, label='wOVVO', debug=debug)
@@ -515,23 +585,23 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
         Fvva += _einsum('mf,mfae->ae', t1a[:, slc_va], oxvv)
         wovxo += _einsum('jf,mebf->mbej', t1a, oxvv)
         u1a += .5 * _einsum('mief,meaf->ia', t2_ooxv, oxvv)
-        print(u2_ooxv.shape)
         u2_ooxv += _einsum('ie,mbea->imab', t1a, oxvv.conj())
         tmp1aa = SegArray(np.zeros((nocca, nocca, nocca, nvira), dtype=dtype), label='tmp1aa', debug=debug)
         tmp1aa += _einsum('ijef,mebf->ijmb', tau_ooxv, oxvv)
+        tmp1aa = tmp1aa.collect()
         u2_ooxv -= _einsum('ijmb,ma->ijab', tmp1aa, t1a[:, slc_va]*.5)
         oxvv = tmp1aa = None
 
     if nvirb > 0 and noccb > 0:
         OXVV = _get_integral('OXVV')
         OXVV = _fntp(OXVV, 1, 3, 1.0, -1.0)
-    
         Fvvb += _einsum('mf,mfae->ae', t1b[:, slc_vb], OXVV)
         wOVXO += _einsum('jf,mebf->mbej', t1b, OXVV)
         u1b += 0.5 * _einsum('MIEF,MEAF->IA', t2_OOXV, OXVV)
         u2_OOXV += _einsum('ie,mbea->imab', t1b, OXVV.conj())
         tmp1bb = SegArray(np.zeros((noccb, noccb, noccb, nvirb), dtype=dtype), label='tmp1bb', debug=debug)
         tmp1bb += _einsum('ijef,mebf->ijmb', tau_OOXV, OXVV)
+        tmp1bb = tmp1bb.collect()
         u2_OOXV -= _einsum('ijmb,ma->ijab', tmp1bb, t1b[:, slc_vb] * .5)
         OXVV = tmp1bb = None
 
@@ -544,6 +614,7 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
         u2_oOxV += _einsum('IE,maEB->mIaB', t1b, oxVV.conj())
         tmp1ab = SegArray(np.zeros((nocca, noccb, nocca, nvirb), dtype=dtype), label='tmp1ab', debug=debug)
         tmp1ab += _einsum('iJeF,meBF->iJmB', tau_oOxV, oxVV)
+        tmp1ab = tmp1ab.collect()
         u2_oOxV -= _einsum('iJmB,ma->iJaB', tmp1ab, t1a[:, slc_va])
         oxVV = tmp1ab = None
 
@@ -556,48 +627,58 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
         u2_oOxV += _einsum('ie,MBea->iMaB', t1a, OXvv.conj())
         tmp1ba = SegArray(np.zeros((noccb, nocca, nvirb, nocca), dtype=dtype), label='tmp1ba', debug=debug)
         tmp1ba += _einsum('iJeF,MFbe->iJbM', tau_oOxV, OXvv)
-        u2_oOxV -= _einsum('iJbM,MA->iJbA', tmp1ba, t1b[:, slc_vb])
+        tmp1ba = tmp1ba.collect()
+        u2_oOxV -= _einsum('iJbM,MA->iJbA', tmp1ba[:, :, slc_va, :], t1b)
         OXvv = tmp1ba = None
 
+    if checkpoint == 10:
+        u1a = u1a_0 + u1a.collect() # + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() # + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data}
+
+    # pyscf L137-L144
     oxov, oxoo = map(_get_integral, ('oxov', 'oxoo'))
     Woooo = SegArray(np.zeros((nocca, ) * 4, dtype=dtype), label='Woooo', debug=debug)
+    Woooo += _einsum('je,nemi->mnij', t1a[:, slc_va], oxoo)
     Woooo = _fntp(Woooo, 2, 3, 1.0, -1.0)
     Woooo += _einsum('ijef,menf->mnij', tau_ooxv, oxov) * .5
     Woooo = Woooo.collect()
     Woooo += eris.oooo.transpose(0, 2, 1, 3)
-    u2_ooxv += _einsum('mnab,mnij->ijab', tau_ooxv, Woooo*.5)
+    u2_ooxv += _einsum('mnab,mnij->ijab', tau_ooxv, Woooo * .5)
     Woooo = tau_ooxv = None
+
+    # pyscf L145-L149
     oxoo = oxoo - oxoo.transpose(2, 1, 0, 3)
     Fooa += _einsum("ne,nemi->mi", t1a[:, slc_va], oxoo)
-    # u1_ox: part of u1a where virtual index 'a' is segmented.
     u1_ox = SegArray(np.zeros((nocca, nvira_seg)), seg_idx=1, seg_spin=0, label='u1_ox', debug=debug)
     u1_ox += .5 * _einsum('mnae,meni->ia', t2_ooxv, oxoo)
     wovxo += _einsum('nb,nemj->mbej', t1a, oxoo)
     oxoo = None
 
+    # pyscf L151-L161
     til_ooxv = make_tau_aa(t2_ooxv.data, t1a.data, t1a.data, vlocs=vlocs_a, fac=0.5)
     til_ooxv = SegArray(til_ooxv, seg_idx=2, seg_spin=0, label='til_aa', debug=debug)
     oxov = _fntp(oxov, 1, 3, 1.0, -1.0)
     F_xv = SegArray(np.zeros((nvira_seg, nvira), dtype=dtype), seg_idx=0, seg_spin=0, label='F_xv', debug=debug)
     F_xv -= .5 * _einsum("mnaf,menf->ae", til_ooxv, oxov, out=F_xv)
-    Fooa -= .5 * _einsum('inef,menf->mi', til_ooxv, oxov)
+    Fooa += .5 * _einsum('inef,menf->mi', til_ooxv, oxov)
     F_ox = SegArray(np.zeros((nocca, nvira_seg), dtype=dtype), seg_idx=1, seg_spin=0, label='F_ox', debug=debug)
-    F_ox += _einsum('nf,menf->me',t1a, oxov)
+    F_ox += _einsum('nf,menf->me', t1a, oxov)
     u2_ooxv += oxov.conj().transpose(0, 2, 1, 3) * .5
     wovxo -= .5 * _einsum('jnfb,menf->mbej', t2_ooxv, oxov)
     woVxO += .5 * _einsum('nJfB,menf->mBeJ', t2_oOxV, oxov)
-
     tmpaa = _einsum('jf,menf->mnej', t1a, oxov).set(label='tmpaa')
     wovxo -= _einsum('nb,mnej->mbej', t1a, tmpaa)
     oxov = tmpaa = til_ooxv = None
 
+    # pyscf L163-L175
     OXOV, OXOO = map(_get_integral, ('OXOV', 'OXOO'))
     WOOOO = _einsum('je,nemi->mnij', t1b[:, slc_vb], OXOO).set(label='WOOOO')
     WOOOO = _fntp(WOOOO, 2, 3, 1.0, -1.0)
     WOOOO += _einsum('ijef,menf->mnij', tau_OOXV, OXOV) * .5
     WOOOO = WOOOO.collect()
     WOOOO += eris.OOOO.transpose(0, 2, 1, 3)
-    u2_OOXV += _einsum('mnab,mnij->ijab', tau_OOXV, WOOOO*.5)
+    u2_OOXV += _einsum('mnab,mnij->ijab', tau_OOXV, WOOOO * .5)
     WOOOO = tau_OOXV = None
     OXOO = OXOO - OXOO.transpose(2, 1, 0, 3)
     Foob += _einsum('ne,nemi->mi', t1b[:, slc_vb], OXOO)
@@ -605,19 +686,21 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
     wOVXO += _einsum('nb,nemj->mbej', t1b, OXOO)
     OXOO = None
 
+    # pyscf L177-187
     til_OOXV = make_tau_aa(t2_OOXV.data, t1b.data, t1b.data, vlocs=vlocs_b, fac=0.5)
     til_OOXV = SegArray(til_OOXV, seg_idx=2, seg_spin=1, label='til_bb', debug=debug)
     OXOV = _fntp(OXOV, 1, 3, 1.0, -1.0)
     F_XV = -.5 * _einsum('MNAF,MENF->AE', til_OOXV, OXOV).set(label='F_XV')
     Foob += .5 * _einsum('inef,menf->mi', til_OOXV, OXOV)
     F_OX = _einsum('nf,menf->me', t1b, OXOV).set(label='F_OX')
-    u2_OOXV += OXOV.conj().transpose(0,2,1,3) * .5
-    wOVXO -= 0.5 * _einsum('jnfb,menf->mbej', t2_OOXV, OXOV)
-    wOvXo += 0.5 * _einsum('jNbF,MENF->MbEj', t2_oOxV, OXOV)
+    u2_OOXV += OXOV.conj().transpose(0, 2, 1, 3) * .5
+    wOVXO -= .5 * _einsum('jnfb,menf->mbej', t2_OOXV, OXOV)
+    wOvXo += .5 * _einsum('jNbF,MENF->MbEj', t2_oOxV, OXOV, out=wOvXo)
     tmpbb = _einsum('jf,menf->mnej', t1b, OXOV).set(label='tmpbb')
     wOVXO -= _einsum('nb,mnej->mbej', t1b, tmpbb)
     OXOV = tmpbb = til_OOXV = None
 
+    # pyscf L189-L207
     OXoo, oxOO = map(_get_integral, ('OXoo', 'oxOO'))
     Fooa += _einsum('NE,NEmi->mi', t1b[:, slc_vb], OXoo)
     u1_ox -= _einsum('nMaE,MEni->ia', t2_oOxV, OXoo)
@@ -630,44 +713,40 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
     WoOoO = _einsum('JE,NEmi->mNiJ', t1b[:, slc_vb], OXoo).set(label='WoOoO')
     WoOoO += _einsum('je,neMI->nMjI', t1a[:, slc_va], oxOO)
     OXoo = oxOO = None
-
     oxOV = _get_integral('oxOV')
     WoOoO += _einsum('iJeF,meNF->mNiJ', tau_oOxV, oxOV)
     WoOoO = WoOoO.collect()
     WoOoO += eris.ooOO.transpose(0, 2, 1, 3)
-
     u2_oOxV += _einsum('mNaB,mNiJ->iJaB', tau_oOxV, WoOoO)
     WoOoO = None
 
-    til_oOxV = make_tau_ab(t2_oOxV.data, (t1a.data, t1b.data), (t1a.data, t1b.data), vlocs=vlocs_a, fac=0.5)
+    if checkpoint == 20:
+        u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data}
+
+    # pyscf L209-229
+    til_oOxV = make_tau_ab(t2_oOxV.data, (t1a.data, t1b.data), (t1a.data, t1b.data), vlocsa=vlocs_a, fac=0.5)
     til_oOxV = SegArray(til_oOxV, seg_idx=2, seg_spin=0, label='til_ab', debug=debug)
-    F_xv -= _einsum('mNaF,meNF->ae', til_oOxV, oxOV)
+    F_xv -= _einsum('mNaF,meNF->ae', til_oOxV, oxOV, out=F_xv)
     Fvvb -= _einsum('nMfA,nfME->AE', til_oOxV, oxOV)
     Fooa += _einsum('iNeF,meNF->mi', til_oOxV, oxOV)
     Foob += _einsum('nIfE,nfME->MI', til_oOxV, oxOV)
     F_ox += _einsum('NF,meNF->me', t1b, oxOV)
-    Fovb = -_einsum('nf,nfME->ME', t1a[:, slc_va], oxOV).set(label='Fovb')
+    Fovb =  _einsum('nf,nfME->ME', t1a[:, slc_va], oxOV).set(label='Fovb')
     til_oOxV = None
-
-    #     u2_oOxV = u2_oOxV.collect()
     u2_oOxV += oxOV.conj().transpose(0, 2, 1, 3)
     wovxo += .5 * _einsum('jNbF,meNF->mbej', t2_oOxV, oxOV, out=wovxo)  # outer
-    wOvxO += .5 * _einsum('nJbF,neMF->MbeJ', t2_oOxV, oxOV, out=wOvxO)
-
-    # Whether this way is correct? Should add the auxiliary array [x],[x]y->y to einsum type.
-    # FIXME NOT correct, since the two slices uses the same rank, but instead they should be independent.
-    # oxOY = SegArray(oxOV.data[:, :, :, slc_vb], seg_idx=1, seg_spin=0, label='oxOY')
-    wOVXO -= .5 * _einsum('nJfB,nfME->MBEJ', t2_oOxV, oxOV) # [x],[x]y->
-    wOvXo -= .5 * _einsum('jnfb,nfME->MbEj', t2_oOxV, oxOV)
-    woVXo += .5 * _einsum('jNfB,mfNE->mBEj', t2_oOxV, oxOV)
+    wOVXO += .5 * _einsum('nJfB,nfME->MBEJ', t2_oOxV, oxOV)
+    wOvXo -= .5 * _einsum('jnfb,nfME->MbEj', t2_ooxv, oxOV)
     woVxO -= .5 * _einsum('JNFB,meNF->mBeJ', t2_OOXV, oxOV)
-
+    woVXo += .5 * _einsum('jNfB,mfNE->mBEj', t2_oOxV, oxOV)
+    wOvxO += .5 * _einsum('nJbF,neMF->MbeJ', t2_oOxV, oxOV, out=wOvxO)
     tmpabab = _einsum('JF,meNF->mNeJ', t1b, oxOV).set(label='tmpabab')
-
     tmpbaba = SegArray(np.zeros((noccb, nocca, nvirb_seg, nocca), dtype=dtype),
                        seg_idx=2, seg_spin=1, label='tmpbaba', debug=debug)
     tmpbaba += _einsum('jf,nfME->MnEj', t1a[:, slc_va], oxOV)
-
+    # tmpbaba = tmpbaba.collect()
     woVxO -= _einsum('NB,mNeJ->mBeJ', t1b, tmpabab)
     wOvXo -= _einsum('nb,MnEj->MbEj', t1a, tmpbaba)
     woVXo += _einsum('NB,NmEj->mBEj', t1b, tmpbaba)
@@ -676,79 +755,93 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
 
     print(f"in update_amps: rank = {rank}, {F_xv.shape}")
 
-    # Collect the 1e properties
-    Fova = SegArray(np.zeros((nocca, nvira), dtype=dtype), label='Fova', debug=debug)
-    Fooa, Foob, Fvva, Fvvb, Fova, Fovb, F_xv, F_XV, F_ox, F_OX, u1a, u1b, u1_ox, u1_OX = [x.collect() for x in 
-        (Fooa, Foob, Fvva, Fvvb, Fova, Fovb, F_xv, F_XV, F_ox, F_OX, u1a, u1b, u1_ox, u1_OX)]
+    if checkpoint == 24:
+        u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data}
 
-    for _arr in (Fooa, Foob, Fvva, Fvvb, Fova, Fovb, F_xv, F_XV, F_ox, F_OX, u1a, u1b, u1_ox, u1_OX):
-        print(f"in update_amps after collection: rank = {rank}, {_arr.label}, {_arr.shape}")
+    Fvva = Fvva_0 + Fvva.collect() + F_xv.collect()
+    Fvvb = Fvvb_0 + Fvvb.collect() + F_XV.collect()
+    Fooa = Fooa_0 + Fooa.collect()
+    Foob = Foob_0 + Foob.collect()
+    Fova = Fova_0 + F_ox.collect()
+    Fovb = Fovb_0 + F_OX.collect() + Fovb.collect()
 
-    Fvva += F_xv
-    Fvvb += F_XV
-    u1a += u1_ox
-    u1b += u1_OX
-    Fova += F_ox
-    Fovb += F_OX
+    # pyscf L231-L242
+    u1a_0 += fova.conj()
+    u1a += _einsum('ie,ae->ia', t1a[:, slc_va], Fvva[:, slc_va])
+    u1_ox -= _einsum('ma,mi->ia', t1a[:, slc_va], Fooa)
+    u1a -= _einsum('imea,me->ia', t2_ooxv, Fova[:, slc_va])
+    u1_ox += _einsum('iMaE,ME->ia', t2_oOxV, Fovb)
+    u1b_0 += fovb.conj()
+    u1b += _einsum('ie,ae->ia', t1b[:, slc_vb], Fvvb[:, slc_vb])
 
-    u1a += fova.conj()
-    u1a += _einsum('ie,ae->ia', t1a, Fvva)
-    u1a -= _einsum('ma,mi->ia', t1a, Fooa)
+    # u1b_0 -= _einsum('ma,mi->ia', t1b, Foob) FIXME error of 1e-6 occurs when I use this line.
+    u1_OX -= _einsum('ma,mi->ia', t1b[:, slc_vb], Foob)
 
-    tmp = _einsum('imea,me->ia', t2_ooxv, Fova[:, slc_va]).collect()
-    u1a -= tmp
-    tmp = _einsum('iMaE,ME->ia', t2_oOxV, Fovb).collect()
-    u1a += tmp
-    u1b += fovb.conj()
-    u1b += _einsum('ie,ae->ia', t1b, Fvvb)
-    u1b -= _einsum('ma,mi->ia', t1b, Foob)
-    tmp = _einsum('imea,me->ia', t2_OOXV, Fovb[:, slc_vb]).collect()
-    u1b -= tmp
-    tmp = _einsum('mIeA,me->IA', t2_oOxV, Fova[:, slc_va]).collect()
-    u1b += tmp
+    u1b -= _einsum('imea,me->ia', t2_OOXV, Fovb[:, slc_vb])
+    u1b += _einsum('mIeA,me->IA', t2_oOxV, Fova[:, slc_va])
 
+    if checkpoint == 25:
+        u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data,
+                'Fova': Fova.data, 'Fovb': Fovb.data,
+                'Fooa': Fooa.data, 'Foob': Foob.data,
+                'Fvva': Fvva.data, 'Fvvb': Fvvb.data,
+                'u2aa': u2_ooxv.collect().data,
+                'u2ab': u2_oOxV.collect().data,
+                'u2bb': u2_OOXV.collect().data}
+
+    # pyscf L244-L252
     ooxv, ovxo = map(_get_integral, ('ooxv', 'ovxo'))
     wovxo -= ooxv.transpose(0, 2, 3, 1)
-    wovxo += ovxo.transpose(0, 2, 1, 3) # ??
+    wovxo += ovxo.transpose(0, 2, 1, 3)
     ooxv -= ovxo.transpose(0, 3, 2, 1)
-    tmp = _einsum('nf,niaf->ia', t1a, ooxv).collect()
-    u1a -= tmp
+    u1_ox -= _einsum('nf,niaf->ia', t1a, ooxv)
     tmp1aa = _einsum('ie,mjbe->mbij', t1a, ooxv).set(label='tmp1aa')
     u2_ooxv += 2. * _einsum('ma,mbij->ijab', t1a, tmp1aa)
     ooxv = ovxo = tmp1aa = None
 
+    # pyscf L254-L262
     OOXV, OVXO = map(_get_integral, ('OOXV', 'OVXO'))
     wOVXO -= OOXV.transpose(0, 2, 3, 1)
     wOVXO += OVXO.transpose(0, 2, 1, 3) # ??
     OOXV -= OVXO.transpose(0, 3, 2, 1)
-    tmp = _einsum('NF,NIAF->IA', t1b, OOXV).collect()
-    u1b -= tmp
-    tmp1bb = _einsum('IE,MJBE->MBIJ', t1b, OOXV).set(label='tmp1bb')
-    u2_OOXV += 2. * _einsum('MA,MBIJ->IJAB', t1b, tmp1bb)
+    u1_OX -= _einsum('NF,NIAF->IA', t1b, OOXV)
+    tmp1bb = _einsum('IE,MJBE->MBIJ', t1b, OOXV).set(label='tmp1bb').collect()
+    u2_OOXV += 2. * _einsum('MA,MBIJ->IJAB', t1b[:, slc_vb], tmp1bb)
     OOXV = OVXO = tmp1bb = None
 
+    # pyscf L264-L272
     ooXV, oxVO = map(_get_integral, ('ooXV', 'oxVO'))
     woVXo -= ooXV.transpose(0, 2, 3, 1)
     woVxO += oxVO.transpose(0, 2, 1, 3)
-    tmp = _einsum('nf,nfAI->IA', t1a[:, slc_va], oxVO).collect()
-    u1b += tmp
-    tmp1ab = _einsum('ie,meBJ->mBiJ', t1a[:, slc_va], oxVO).set(label='tmp1ab')
-    tmp1ab += _einsum('IE,mjBE->mBjI', t1b, ooXV)
-    tmp1ab = tmp1ab.collect()
-    u2_oOxV -= _einsum('ma,mBiJ->iJaB', t1a[:, slc_va], tmp1ab)
-    ooXV = oxVO = tmp1ab = None
+    u1b += _einsum('nf,nfAI->IA', t1a[:, slc_va], oxVO)
+    tmp1_oVoO = _einsum('ie,meBJ->mBiJ', t1a[:, slc_va], oxVO).set(label='tmp1ab').collect()
+    tmp1_oVoO += _einsum('IE,mjBE->mBjI', t1b, ooXV).collect()
+    u2_oOxV -= _einsum('ma,mBiJ->iJaB', t1a[:, slc_va], tmp1_oVoO)
+    ooXV = oxVO = tmp1_oVoO = None
 
+    # pyscf L274-L282
     OOxv, OVxo = map(_get_integral, ('OOxv', 'OVxo'))
     wOvxO -= OOxv.transpose(0, 2, 3, 1)
     wOvXo += OVxo.transpose(0, 2, 1, 3)
-    tmp = _einsum('NF,NFai->ia', t1b, OVxo).collect()
-    u1a += tmp
-    tmp1ba = _einsum('IE,MEbj->MbIj', t1b, OVxo).set(label='tmp1ba')
-    tmp1ba += _einsum('ie,MJbe->MbJi', t1a, OOxv)
-    u2_oOxV -= _einsum('MA,MbIj->jIbA', t1b, tmp1ba)
-    OOxv = OVxo = tmp1ba = None
+    u1_ox += _einsum('NF,NFai->ia', t1b, OVxo)
+    tmp1_OxOo = _einsum('IE,MEbj->MbIj', t1b, OVxo).set(label='tmp1ba') #.collect()
+    tmp1_OxOo += _einsum('ie,MJbe->MbJi', t1a, OOxv) #.collect()
+    u2_oOxV -= _einsum('MA,MbIj->jIbA', t1b, tmp1_OxOo)
+    OOxv = OVxo = tmp1_OxOo = None
 
-    # all the [... slc], ... .collect() are NOT CORRECT
+    if checkpoint == 30:
+        u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data,
+                'u2aa': u2_ooxv.collect().data,
+                'u2ab': u2_oOxV.collect().data,
+                'u2bb': u2_OOXV.collect().data}
+
+    # pyscf: L284-L294
     u2_ooxv += 2. * _einsum('imae,mbej->ijab', t2_ooxv, wovxo)
     u2_ooxv += 2. * _einsum('iMaE,MbEj->ijab', t2_oOxV, wOvXo)
     u2_OOXV += 2. * _einsum('imae,mbej->ijab', t2_OOXV, wOVXO)
@@ -761,39 +854,62 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
     u2_oOxV += 1. * _einsum('mIaE,mBEj->jIaB', t2_oOxV, woVXo)
     wovxo = wOVXO = woVxO = wOvXo = woVXo = wOvxO = None
 
-    Fooa +=  .5 * np.einsum('me,ie->mi', fova, t1a.data)
-    Foob +=  .5 * np.einsum('me,ie->mi', fovb, t1b.data)
-    Fvva += -.5 * np.einsum('me,ma->ae', fova, t1a.data)
-    Fvvb += -.5 * np.einsum('me,ma->ae', fovb, t1b.data)
-    Fooa += (eris.focka[:nocca,:nocca] - np.diag(mo_ea_o))
-    Foob += (eris.fockb[:noccb,:noccb] - np.diag(mo_eb_o))
-    Fvva += (eris.focka[nocca:,nocca:] - np.diag(mo_ea_v))
-    Fvvb += (eris.fockb[noccb:,noccb:] - np.diag(mo_eb_v))
+    if checkpoint == 35:
+        u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data,
+                'u2aa': u2_ooxv.collect().data,
+                'u2ab': u2_oOxV.collect().data,
+                'u2bb': u2_OOXV.collect().data}
 
-
-    Ftmpa = Fvva - .5 * _einsum('mb,me->be', t1a, Fova)
-    Ftmpb = Fvvb - .5 * _einsum('mb,me->be', t1b, Fovb)
+    # pyscf: L296-L307
+    Ftmpa = Fvva - .5 * _einsum('mb,me->be', t1a, Fova[:, slc_va]).collect()
+    Ftmpb = Fvvb - .5 * _einsum('mb,me->be', t1b, Fovb[:, slc_vb]).collect()
     u2_ooxv += _einsum('ijae,be->ijab', t2_ooxv, Ftmpa)
     u2_OOXV += _einsum('ijae,be->ijab', t2_OOXV, Ftmpb)
     u2_oOxV += _einsum('iJaE,BE->iJaB', t2_oOxV, Ftmpb)
     u2_oOxV += _einsum('iJeA,be->iJbA', t2_oOxV, Ftmpa[slc_va])
-    Ftmpa = Fooa + .5 * _einsum('je,me->mj', t1a, Fova)
-    Ftmpb = Foob + .5 * _einsum('je,me->mj', t1b, Fovb)
+    Ftmpa = Ftmpb = None
+
+    Ftmpa = Fooa + .5 * _einsum('je,me->mj', t1a[:, slc_va], Fova[:, slc_va]).collect()
+    Ftmpb = Foob + .5 * _einsum('je,me->mj', t1b[:, slc_vb], Fovb[:, slc_vb]).collect()
     u2_ooxv -= _einsum('imab,mj->ijab', t2_ooxv, Ftmpa)
     u2_OOXV -= _einsum('imab,mj->ijab', t2_OOXV, Ftmpb)
     u2_oOxV -= _einsum('iMaB,MJ->iJaB', t2_oOxV, Ftmpb)
     u2_oOxV -= _einsum('mIaB,mj->jIaB', t2_oOxV, Ftmpa)
-    
+    # Ftmpa = Ftmpb = None
+    # pyscf: L309-L319
     oxoo, OXOO, OXoo, oxOO = map(_get_integral, ('oxoo', 'OXOO', 'OXoo', 'oxOO'))
-    oxoo = oxoo - oxoo.transpose(2, 1, 0, 3)
-    OXOO = OXOO - OXOO.transpose(2, 1, 0, 3)
-    u2_ooxv -= _einsum('ma,jbim->ijab', t1a, oxoo)
-    u2_OOXV -= _einsum('ma,jbim->ijab', t1b, OXOO)
-    u2_oOxV -= _einsum('ma,JBim->iJaB', t1a, OXoo)
+    oxoo = _fntp(oxoo, 0, 2, 1.0, -1.0)
+    OXOO = _fntp(OXOO, 0, 2, 1.0, -1.0)
+    u2_ooxv -= _einsum('ma,jbim->ijab', t1a[:, slc_va], oxoo, out=u2_ooxv)
+    u2_OOXV -= _einsum('ma,jbim->ijab', t1b[:, slc_vb], OXOO, out=u2_OOXV)
+    u2_oOxV -= _einsum('ma,JBim->iJaB', t1a[:, slc_va], OXoo, out=u2_oOxV)
     u2_oOxV -= _einsum('MA,ibJM->iJbA', t1b, oxOO)
-    oxoo = OXOO = OXoo = oxOO = None
 
-    print(f"rank {rank} : update_amps: {u2_ooxv.shape}, {u2_oOxV.shape}, {u2_OOXV.shape}")
+    if checkpoint == 40: # during 35-40, error from 1e-17 to 1e-10
+        u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+        u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+        return {'u1a': u1a.data, 'u1b': u1b.data,
+                'u2aa': u2_ooxv.collect().data,
+                'u2ab': u2_oOxV.collect().data,
+                'u2bb': u2_OOXV.collect().data,
+                'Ftmpa': Ftmpa.data,
+                'Ftmpb': Ftmpb.data,
+                'ovoo': oxoo.collect().data,
+                'OVOO': OXOO.collect().data,
+                'ovOO': oxOO.collect().data,
+                'OVoo': OXoo.collect().data,
+                'Fooa': Fooa.data,
+                'Foob': Foob.data,
+                'Fova': Fova.data,
+                'Fovb': Fovb.data,
+                'Fvva': Fvva.data,
+                'Fvvb': Fvvb.data,
+                't1a': t1a.data,
+                't1b': t1b.data,}
+
+    oxoo = OXOO = OXoo = oxOO = None
 
     u2_ooxv *= .5
     u2_OOXV *= .5
@@ -804,6 +920,10 @@ def update_amps(cc, t1, t2, eris) -> tuple[tuple[ArrayLike, ArrayLike], tuple[Ar
 
     eia_a = lib.direct_sum('i-a->ia', mo_ea_o, mo_ea_v)
     eia_b = lib.direct_sum('i-a->ia', mo_eb_o, mo_eb_v)
+
+    u1a = u1a_0 + u1a.collect() + u1_ox.collect()
+    u1b = u1b_0 + u1b.collect() + u1_OX.collect()
+
     u1a /= eia_a
     u1b /= eia_b
 

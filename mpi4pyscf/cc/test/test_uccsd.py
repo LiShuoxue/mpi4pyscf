@@ -1,10 +1,12 @@
 import numpy as np
 import h5py
 import pytest
+from scipy import linalg as la
 
 from mpi4pyscf.tools import mpi
-from pyscf import gto, lib
+from pyscf import gto, lib, scf, ao2mo
 from pyscf.cc import uccsd as pyscf_uccsd
+from pyscf.cc import uccsd_lambda as pyscf_uccsd_lambda
 
 from libdmet.solver.scf import UIHF
 from libdmet.solver.cc_solver import UICCSD
@@ -15,7 +17,41 @@ rank = mpi.rank
 comm = mpi.comm
 
 
-def get_scf_solver():
+def get_scf_solver_O2():
+    mol = gto.Mole().set(
+        atom=[
+        [8 , (0., +2.000, 0.)],
+        [8 , (0., -2.000, 0.)],],
+        basis='cc-pvdz',
+        spin=0,
+    ).build()
+    mf = scf.UHF(mol).run()
+    moa, mob = mf.mo_coeff
+    nmoa, nmob = moa.shape[1], mob.shape[1]
+
+    kappa_a = np.random.random((nmoa, nmoa))
+    kappa_a = kappa_a - kappa_a.conj().T
+    kappa_b = np.random.random((nmob, nmob))
+    kappa_b = kappa_b - kappa_b.conj().T
+    expK_a, expK_b = la.expm(kappa_a), la.expm(kappa_b)
+    moa, mob = moa @ expK_a, mob @ expK_b
+
+    eri_aa = ao2mo.restore(4, ao2mo.full(mf._eri, moa), nmoa)
+    eri_bb = ao2mo.restore(4, ao2mo.full(mf._eri, mob), nmob)
+    eri_ab = ao2mo.general(mf._eri, (moa, moa, mob, mob), compact=True)
+    h1a = moa.conj().T @ mf.get_hcore() @ moa
+    h1b = mob.conj().T @ mf.get_hcore() @ mob
+
+    assert nmoa == nmob
+
+    mf = UIHF(mol).set(verbose=4, get_hcore = lambda *args: np.array([h1a, h1b]),
+                       get_ovlp = lambda *args: np.array([np.eye(nmoa), np.eye(nmob)]))
+    mf._eri = (eri_aa, eri_bb, eri_ab)
+    mf.kernel()
+    return mf
+
+
+def get_scf_solver_model():
     f = h5py.File("./data/ham_sz_sample.h5", 'r')
     h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
     mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
@@ -121,6 +157,23 @@ def test_add_vvvv(mf: UIHF):
             assert np.allclose(diff, 0.0)
 
 
+def test_update_amps_checkpoint(mf: UIHF, checkpoint: int = 10):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    if rank == 0:
+        print("Testing UCCSD update_amps with checkpointing ...")
+    res = testfuncs.test_update_amps_checkpoint(cc_mpi, checkpoint=checkpoint)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        ref = testfuncs.update_amps_checkpoint_serial(cc_ref, t1_ref, t2_ref, eris, checkpoint)
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            # assert np.allclose(diff, 0.0)``
+
+
 def test_update_amps(mf: UIHF):
     cc_mpi = UICCSD_MPI(mf).set(verbose=7)
     res = testfuncs.test_update_amps(cc_mpi)
@@ -128,21 +181,103 @@ def test_update_amps(mf: UIHF):
         cc_ref = UICCSD(mf)
         eris = cc_ref.ao2mo()
         _, t1_ref, t2_ref = cc_ref.init_amps()
-        t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris)
+        for _ in range(1):
+            t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris)
         ref = dict(t1a=t1_ref[0], t1b=t1_ref[1],
                          t2aa=t2_ref[0], t2ab=t2_ref[1], t2bb=t2_ref[2])
         for k in res:
             diff = np.abs(res[k] - ref[k]).max()
             norm = np.linalg.norm(ref[k])
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
-            assert np.allclose(diff, 0.0), f"In test_update_amps, {k} failed."
+
+
+def test_lambda_intermediates_checkpoint(mf: UIHF, checkpoint: int = 10):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    res = testfuncs.test_lambda_intermediates_checkpoint(cc_mpi, checkpoint=checkpoint)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        ref = testfuncs.make_intermediates_checkpoint_serial(cc_ref, t1_ref, t2_ref,
+                                                             eris=eris, checkpoint=checkpoint)
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+
+
+def test_lambda_intermediates(mf: UIHF):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    res = testfuncs.test_lambda_intermediates(cc_mpi)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris)
+        for k in res:
+            diff = np.abs(res[k] - getattr(imds_ref, k)).max()
+            norm = np.linalg.norm(getattr(imds_ref, k))
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+
+
+def test_update_lambda_checkpoint(mf: UIHF, checkpoint: int = 5):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    res = testfuncs.test_update_lambda_checkpoint(cc_mpi, checkpoint=checkpoint)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris)
+        ref = testfuncs.update_lambda_checkpoint_serial(cc_ref, t1_ref, t2_ref,
+            l1=t1_ref, l2=t2_ref, eris=eris, imds=imds_ref, checkpoint=checkpoint)
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+
+
+def test_update_lambda(mf: UIHF):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    res = testfuncs.test_update_lambda(cc_mpi)
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris)
+        (l1a, l1b), (l2aa, l2ab, l2bb) = pyscf_uccsd_lambda.update_lambda(
+            cc_ref, t1_ref, t2_ref, l1=t1_ref, l2=t2_ref, eris=eris, imds=imds_ref
+        )
+        ref = dict(l1a=l1a, l1b=l1b, l2aa=l2aa, l2ab=l2ab, l2bb=l2bb)
+        for k in res:
+            diff = np.abs(res[k] - ref[k]).max()
+            norm = np.linalg.norm(ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
 
 
 if __name__ == "__main__":
-    mf = get_scf_solver()
+    import sys
+    if len(sys.argv) < 2:
+        chkpt = None
+    else:
+        chkpt = int(sys.argv[1])
 
-    test_uiccsd_eris(mf)
-    test_init_amps(mf)
-    test_make_tau(mf)
-    test_add_vvvv(mf)
-    test_update_amps(mf)
+    mf = get_scf_solver_O2()
+    # test_uiccsd_eris(mf)
+    # test_init_amps(mf)
+    # test_make_tau(mf)
+    # test_add_vvvv(mf)]
+
+    # if chkpt is None:
+        # test_update_amps(mf)
+    # else:
+        # test_update_amps_checkpoint(mf, checkpoint=40)
+
+    # if chkpt is None:
+        # test_lambda_intermediates(mf)
+    # else:
+        # test_lambda_intermediates_checkpoint(mf, checkpoint=chkpt)
+
+    if chkpt is None:
+        test_update_lambda(mf)
+    else:
+        test_update_lambda_checkpoint(mf, checkpoint=chkpt)

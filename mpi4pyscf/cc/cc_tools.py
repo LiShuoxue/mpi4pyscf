@@ -37,14 +37,16 @@ def collect_array(arr: ArrayLike, seg_idx: int | None = None, debug: bool = Fals
     """
     if seg_idx is None:
         # allreduce sends 
-        return mpi.reduce(arr) if sum_over else arr
+        res = mpi.reduce(arr) if sum_over else arr
     else:
         ndim = arr.ndim
         tp = (seg_idx, ) + tuple(range(seg_idx)) + tuple(range(seg_idx+1, ndim))
         tp_inv = tuple(np.argsort(tp))
         if rank == 0 and debug:
             print(f"seg_idx = {seg_idx}, tp = {tp}, tp_inv = {tp_inv}")
-        return mpi.gather_new(arr.transpose(tp)).transpose(tp_inv)
+        res = mpi.gather_new(arr.transpose(tp)).transpose(tp_inv)
+    res = mpi.bcast(res, root=0)
+    return res
 
 
 def get_mpi_array(arr_fn: callable, vlocs: list, seg_idx: int | None = None,
@@ -374,56 +376,82 @@ class SegArray(lib.StreamObject):
         seg_idx: the segmented index.
         seg_spin: any type, the spin (or other kind of label) of the segmented index, default None.
         label: a string label for the array.
+        debug: whether to print debug information.
+        reduced: whether the array is reduced from the different MPI processes, default False.
     """
-    def __init__(self, data: ArrayLike,
-                 seg_idx: int | None = None, seg_spin = None,
-                 label: str = '', debug: bool = False):
-        self.data = data
+    def __init__(self, data, seg_idx: int | None = None, seg_spin = None,
+                 label: str = '', debug: bool = False, reduced: bool = False,
+                 dtype: type = np.float64):
+
+        if isinstance(data, tuple):
+            self.data = np.zeros(shape=data, dtype=dtype)
+        elif isinstance(data, SegArray):
+            self.data = data.data
+        else:
+            self.data = data
         self.seg_idx = seg_idx
         self.seg_spin = seg_spin
         self.label = label
+        self.reduced = reduced
         self.debug = debug
 
     # define negative operation
     def __neg__(self):
-        return SegArray(-self.data, self.seg_idx, self.seg_spin, self.label)
+        return SegArray(-self.data, self.seg_idx, self.seg_spin, self.label,
+                        debug=self.debug, reduced=self.reduced)
+
+    def print_debug(self, s: str):
+        if rank == 0 and self.debug:
+            print(s)
 
     def __add__(self, other):
-        _o = other if not isinstance(other, SegArray) else other.data
-        if isinstance(other, SegArray):
-            if self.seg_idx != other.seg_idx: # re-segment other to self.seg_idx
-                if rank == 0 and self.debug:
-                    print(f"In SegArray.__add__: merging different segmented indices\n"
-                          f"self.seg_idx = {self.seg_idx}, other.seg_idx = {other.seg_idx}")
-                has_seg_state = isinstance(self.seg_idx, int) + ((isinstance(other.seg_idx, int)) << 1)
-                match has_seg_state:
-                    case 3: # [self], [other]
-                        _o = resegment(_o, seg_idx_old=other.seg_idx, seg_idx_new=self.seg_idx)
-                    case 2: # self, [other]
-                        _o = collect_array(_o, seg_idx=other.seg_idx)
-                    case 1: # [self], other
-                        _o = collect_array(_o, seg_idx=None)
-                        vlocs = get_vlocs(_o.shape[self.seg_idx])
-                        _o = get_mpi_array(lambda: _o, vlocs=vlocs, seg_idx=self.seg_idx, debug=False)
-                    case _:
-                        raise ValueError("Cannot identify the segmented state of the two arrays.")
+        """
+        +---------+-----------+--------------------+
+        | self    |  other    |  action            |
+        +---------+-----------+--------------------+
+        | Any     | np        | add locally        |
+        | R       | R         | add locally        |
+        | R       | NR        | collect other, add |
+
+
+        """
+        _o = other if isinstance(other, np.ndarray) else other.data
 
         if isinstance(other, SegArray):
-            other_label = other.label if other.label != "" else "unknown"
-            print(f"Rank{rank}: {self.label} {self.data.shape} {other_label} {_o.shape}")
+            if self.seg_idx is None and other.seg_idx is None:
+                if self.reduced and (not other.reduced):
+                    self.print_debug("    [SegArray:+] R + NR")
+                    _o = other.collect().data
+                elif (not self.reduced) and other.reduced:
+                    raise ValueError("Cannot add a reduced array to non-reduced and non-segmented array.")
+                else:   # both reduced or both non-reduced
+                    _o = other.data
+            elif self.seg_idx == other.seg_idx:
+                _o = other.data
+            elif isinstance(self.seg_idx, int):     # self segmented and other does not have same segmented index
+                self.print_debug(f"    [SegArray:+] Seg{self.seg_idx} + Seg{other.seg_idx}")
+                _reduced_data = other.collect().data
+                vlocs = get_vlocs(_reduced_data.shape[self.seg_idx])
+                _o = get_mpi_array(lambda: _reduced_data, vlocs=vlocs, seg_idx=self.seg_idx, debug=self.debug)
+            else:   # self is not segmented
+                assert isinstance(other.seg_idx, int)
+                assert self.reduced
+                _o = other.collect().data
 
-        # When the array does not have segment, just broadcast the added result
-        if self.seg_idx is None:
-            arr_fn = lambda: self.data + _o
-            arr = get_mpi_array(arr_fn=arr_fn, vlocs=None, seg_idx=None, debug=self.debug)
+        if self.reduced:
+            arr = None if rank != 0 else self.data + _o
+            arr = mpi.bcast(arr, root=0)
         else:
             arr = self.data + _o
 
-        return SegArray(arr, self.seg_idx, self.seg_spin, self.label, self.debug)
+        return SegArray(arr, self.seg_idx, self.seg_spin, self.label, self.debug, reduced=self.reduced)
+
 
     def __mul__(self, other):
         _o = other.data if isinstance(other, SegArray) else other
-        return SegArray(self.data * _o, self.seg_idx, self.seg_spin, self.label, self.debug)
+        if isinstance(other, SegArray) and (self.reduced != other.reduced):
+            raise ValueError("Multiplication is only supported with same reduced status.")
+        return SegArray(self.data * _o, self.seg_idx, self.seg_spin, self.label, self.debug, reduced=self.reduced)
 
     __rmul__ = __mul__
 
@@ -434,7 +462,9 @@ class SegArray(lib.StreamObject):
     # define division operation
     def __truediv__(self, other):
         _o = other.data if isinstance(other, SegArray) else other
-        return SegArray(self.data / _o, self.seg_idx, self.seg_spin, self.label, self.debug)
+        if isinstance(other, SegArray) and (self.reduced != other.reduced):
+            raise ValueError("Multiplication is only supported with same reduced status.")
+        return SegArray(self.data / _o, self.seg_idx, self.seg_spin, self.label, self.debug, reduced=self.reduced)
 
     def __repr__(self):
         return (f"SegArray({self.label}) <seg_idx={self.seg_idx}, seg_spin={self.seg_spin}>: \n"
@@ -450,10 +480,10 @@ class SegArray(lib.StreamObject):
             return self
         else:
             assert self.seg_idx is None, "Indexing should be used for non-segmented array."
-            return SegArray(data=self.data[key], seg_idx=idxs[0], label=self.label, debug=self.debug)
+            return SegArray(data=self.data[key], seg_idx=idxs[0], label=self.label, debug=self.debug, reduced=False)
 
     def conj(self):
-        return SegArray(self.data.conj(), self.seg_idx, self.seg_spin, self.label, self.debug)
+        return SegArray(self.data.conj(), self.seg_idx, self.seg_spin, self.label, self.debug, reduced=self.reduced)
 
     def transpose(self, *args):
         if len(args) == 1:
@@ -462,15 +492,21 @@ class SegArray(lib.StreamObject):
             tp = tuple(range(self.data.ndim))[::-1]
         else:
             tp = args
-        new_idx = tp.index(self.seg_idx)
+        new_idx = None if self.seg_idx is None else tp.index(self.seg_idx)
         if rank == 0 and self.debug:
             print(f"In SegArray.transpose: old seg_idx = {self.seg_idx}, new seg_idx = {new_idx}, tp = {tp}")
-        return SegArray(self.data.transpose(*args), new_idx, self.seg_spin, self.label, self.debug)
+        return SegArray(self.data.transpose(*args), new_idx, self.seg_spin, self.label, self.debug, reduced=self.reduced)
 
     @property
     def shape(self) -> tuple:
         return self.data.shape
 
     def collect(self):
+        """
+        If the array is calculated from different procs, collect it
+        """
+        if self.reduced:
+            return self
         arr = collect_array(self.data, self.seg_idx, debug=self.debug)
-        return SegArray(data=arr, seg_idx=None, seg_spin=None, label=self.label, debug=self.debug)
+        return SegArray(data=arr, seg_idx=None, seg_spin=None,
+                        label=self.label, debug=self.debug, reduced=True)
