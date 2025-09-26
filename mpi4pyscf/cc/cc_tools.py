@@ -42,14 +42,12 @@ def collect_array(arr: ArrayLike, seg_idx: int | None = None, debug: bool = Fals
         ndim = arr.ndim
         tp = (seg_idx, ) + tuple(range(seg_idx)) + tuple(range(seg_idx+1, ndim))
         tp_inv = tuple(np.argsort(tp))
-        if rank == 0 and debug:
-            print(f"seg_idx = {seg_idx}, tp = {tp}, tp_inv = {tp_inv}")
         res = mpi.gather_new(arr.transpose(tp)).transpose(tp_inv)
     res = mpi.bcast(res, root=0)
     return res
 
 
-def get_mpi_array(arr_fn: callable, vlocs: list, seg_idx: int | None = None,
+def get_mpi_array(arr_fn: callable, vlocs: list | None = None, seg_idx: int | None = None,
                   debug: bool = False) -> ArrayLike:
     """
     Get the array that is either non-segmented (seg_idx is None) or segmented by one index.
@@ -62,6 +60,7 @@ def get_mpi_array(arr_fn: callable, vlocs: list, seg_idx: int | None = None,
         return arr
 
     if rank == 0:
+        assert vlocs is not None
         arr = arr_fn() if callable(arr_fn) else arr_fn
         segs = [(slice(None), ) * seg_idx + (slice(*x), ) for x in vlocs]
         arr_segs = [arr[slc] for slc in segs]
@@ -266,7 +265,6 @@ def __get_segmented_einsum_type(subscripts: str, seg_idxs: tuple, debug: bool = 
 
     # the segment index of the output array
     final_idx = [None, seg_idx1f, seg_idx2f, -1][sum((x is not None) << i for i, x in enumerate((seg_idx1f, seg_idx2f)))]
-
     # When the output array contains all the segmented indices,
     # the final index is either given by the user or the same as seg_idx1f.
 
@@ -510,3 +508,8 @@ class SegArray(lib.StreamObject):
         arr = collect_array(self.data, self.seg_idx, debug=self.debug)
         return SegArray(data=arr, seg_idx=None, seg_spin=None,
                         label=self.label, debug=self.debug, reduced=True)
+
+    def copy(self):
+        return SegArray(data=_cp(self.data), seg_idx=self.seg_idx,
+                        seg_spin=self.seg_spin, label=self.label,
+                        debug=self.debug, reduced=self.reduced)

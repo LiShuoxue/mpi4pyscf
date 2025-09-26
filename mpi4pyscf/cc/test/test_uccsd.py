@@ -28,6 +28,7 @@ def get_scf_solver_O2():
     mf = scf.UHF(mol).run()
     moa, mob = mf.mo_coeff
     nmoa, nmob = moa.shape[1], mob.shape[1]
+    np.random.seed(1919810)
 
     kappa_a = np.random.random((nmoa, nmoa))
     kappa_a = kappa_a - kappa_a.conj().T
@@ -191,6 +192,22 @@ def test_update_amps(mf: UIHF):
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
 
 
+def test_energy(mf: UIHF):
+    max_cycle = 10
+    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+    res = testfuncs.test_energy(cc_mpi)
+    if rank == 0:
+        cc_ref = UICCSD(mf).set(verbose=5)
+        eris = cc_ref.ao2mo()
+        _, t1, t2 = cc_ref.init_amps()
+        for _ in range(max_cycle):
+            t1, t2 = cc_ref.update_amps(t1, t2, eris)
+        E_ref = cc_ref.energy(t1=t1, t2=t2, eris=eris)
+        diff = np.abs(res - E_ref)
+        print(f"Difference of energy: {diff} / {np.abs(E_ref)} = {diff/np.abs(E_ref)}")
+        assert np.allclose(diff, 0.0)
+
+
 def test_lambda_intermediates_checkpoint(mf: UIHF, checkpoint: int = 10):
     cc_mpi = UICCSD_MPI(mf).set(verbose=7)
     res = testfuncs.test_lambda_intermediates_checkpoint(cc_mpi, checkpoint=checkpoint)
@@ -222,18 +239,25 @@ def test_lambda_intermediates(mf: UIHF):
 
 def test_update_lambda_checkpoint(mf: UIHF, checkpoint: int = 5):
     cc_mpi = UICCSD_MPI(mf).set(verbose=7)
-    res = testfuncs.test_update_lambda_checkpoint(cc_mpi, checkpoint=checkpoint)
+    res, imds = testfuncs.test_update_lambda_checkpoint(cc_mpi, checkpoint=checkpoint)
     if rank == 0:
         cc_ref = UICCSD(mf)
         eris = cc_ref.ao2mo()
         _, t1_ref, t2_ref = cc_ref.init_amps()
+        l1_ref, l2_ref = t1_ref, t2_ref
         imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris)
-        ref = testfuncs.update_lambda_checkpoint_serial(cc_ref, t1_ref, t2_ref,
-            l1=t1_ref, l2=t2_ref, eris=eris, imds=imds_ref, checkpoint=checkpoint)
+        ref = testfuncs.update_lambda_checkpoint_serial(cc_ref, t1=t1_ref, t2=t2_ref,
+            l1=l1_ref, l2=l2_ref, eris=eris, imds=imds_ref, checkpoint=checkpoint)
+        """
+        for k in imds:
+            diff = np.abs(imds[k] - getattr(imds_ref, k)).max()
+            norm = np.linalg.norm(getattr(imds_ref, k))
+            print(f"Difference of intermediate {k}: {diff} / {norm} = {diff/norm}")
+        """
         for k in res:
             diff = np.abs(res[k] - ref[k]).max()
             norm = np.linalg.norm(ref[k])
-            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            print(f"Difference of update_lambda {k}: {diff} / {norm} = {diff/norm}")
 
 
 def test_update_lambda(mf: UIHF):
@@ -241,43 +265,71 @@ def test_update_lambda(mf: UIHF):
     res = testfuncs.test_update_lambda(cc_mpi)
     if rank == 0:
         cc_ref = UICCSD(mf)
-        eris = cc_ref.ao2mo()
-        _, t1_ref, t2_ref = cc_ref.init_amps()
-        imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris)
+        eris_ref = cc_ref.ao2mo()
+        _, t10, t20 = cc_ref.init_amps()
+        t1_ref, t2_ref = cc_ref.update_amps(t10, t20, eris=eris_ref)
+        t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris_ref)
+        l1_ref, l2_ref = t10, t20
+        imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris_ref)
         (l1a, l1b), (l2aa, l2ab, l2bb) = pyscf_uccsd_lambda.update_lambda(
-            cc_ref, t1_ref, t2_ref, l1=t1_ref, l2=t2_ref, eris=eris, imds=imds_ref
+            cc_ref, t1=t1_ref, t2=t2_ref, l1=l1_ref, l2=l2_ref, eris=eris_ref, imds=imds_ref
         )
         ref = dict(l1a=l1a, l1b=l1b, l2aa=l2aa, l2ab=l2ab, l2bb=l2bb)
         for k in res:
             diff = np.abs(res[k] - ref[k]).max()
             norm = np.linalg.norm(ref[k])
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            assert np.allclose(diff, 0.0)
+
+
+def test_ccsd_kernel(mf: UIHF):
+    import cProfile, pstats
+    profile_filename = f"test_uccsd.prof"
+
+    pr = cProfile.Profile()
+    pr.enable()
+    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+    cc_mpi.kernel()
+
+    pr.disable()
+    pr.dump_stats(profile_filename)
+
+    if rank == 0:
+        stats = pstats.Stats(pr)
+        stats.sort_stats('cumulative').print_stats(60) # Print top 10 cumulative stats
+
+    if rank == 0:
+        cc_ref = UICCSD(mf).set(verbose=5)
+        cc_ref.kernel()
+        diff = np.abs(cc_mpi.e_corr - cc_ref.e_corr)
+        print(f"Difference of CCSD energy: {diff} / {np.abs(cc_ref.e_corr)} = {diff/np.abs(cc_ref.e_corr)}")
+        assert np.allclose(diff, 0.0)
 
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) < 2:
-        chkpt = None
-    else:
-        chkpt = int(sys.argv[1])
+
+    task = sys.argv[1]
+    if len(sys.argv) < 3: chkpt = None
+    else: chkpt = int(sys.argv[2])
 
     mf = get_scf_solver_O2()
-    # test_uiccsd_eris(mf)
-    # test_init_amps(mf)
-    # test_make_tau(mf)
-    # test_add_vvvv(mf)]
 
-    # if chkpt is None:
-        # test_update_amps(mf)
-    # else:
-        # test_update_amps_checkpoint(mf, checkpoint=40)
+    if task == "eris": test_uiccsd_eris(mf)
+    if task == "init_amps": test_init_amps(mf)
+    if task == "tau": test_make_tau(mf)
+    if task == "vvvv": test_add_vvvv(mf)
+    if task == 'energy': test_energy(mf)
+    if task == "kernel": test_ccsd_kernel(mf)
 
-    # if chkpt is None:
-        # test_lambda_intermediates(mf)
-    # else:
-        # test_lambda_intermediates_checkpoint(mf, checkpoint=chkpt)
+    if task == "amps":
+        if chkpt is None: test_update_amps(mf)
+        else: test_update_amps_checkpoint(mf, checkpoint=40)
 
-    if chkpt is None:
-        test_update_lambda(mf)
-    else:
-        test_update_lambda_checkpoint(mf, checkpoint=chkpt)
+    if task == "imds":
+        if chkpt is None: test_lambda_intermediates(mf)
+        else: test_lambda_intermediates_checkpoint(mf, checkpoint=chkpt)
+
+    if task == "lambda":
+        if chkpt is None: test_update_lambda(mf=mf)
+        else: test_update_lambda_checkpoint(mf, checkpoint=chkpt)

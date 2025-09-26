@@ -907,7 +907,7 @@ class CCSD(ccsd.CCSD):
         """
         Hook for dumping results and clearing up the object.
         """
-        ccsd.CCSD._finalize(self)
+        # ccsd.CCSD._finalize(self)
         # ZHC NOTE unregister the ccsd_obj
         #self._release_regs()
         return self

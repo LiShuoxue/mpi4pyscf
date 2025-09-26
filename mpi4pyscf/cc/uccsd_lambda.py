@@ -1,19 +1,16 @@
 """
-MPI-UCCSD with real integrals.
+MPI Implementation of UCCSD lambda equations
+
+Author: Shuoxue Li <sli7@caltech.edu>
 """
 from functools import partial
 import numpy as np
-from numpy.typing import ArrayLike
 
-from pyscf import lib, ao2mo, __config__
-from pyscf.cc import uccsd as pyscf_uccsd
-from mpi4pyscf.cc import uccsd as mpi_uccsd
-
-from libdmet.utils.misc import take_eri, tril_take_idx
+from pyscf import lib
 
 from mpi4pyscf.lib import logger
 from mpi4pyscf.tools import mpi
-from mpi4pyscf.cc.ccsd import _sync_, _pack_scf, _task_location
+from mpi4pyscf.cc import uccsd as mpi_uccsd
 from mpi4pyscf.cc import cc_tools as tools
 from mpi4pyscf.cc.cc_tools import SegArray
 
@@ -55,16 +52,7 @@ def make_intermediates(cc, t1, t2, eris, checkpoint: int | None = None):
 
     _fntp = partial(mpi_uccsd.transpose_sz, nvira_or_vlocsa=vlocs_a, nvirb_or_vlocsb=vlocs_b)
     _einsum = partial(mpi_uccsd.einsum_sz, nvira_or_vlocsa=vlocs_a, nvirb_or_vlocsb=vlocs_b)
-
-    def _get_integral(key: str) -> SegArray:
-        seg_idx, seg_spin = None, None
-        arr_label = "eris." + key.replace('x', 'v').replace('X', 'V')
-        for k in 'xX':
-            if k in key:
-                seg_idx, seg_spin = key.index(k), 'xX'.index(k)
-                break
-        reduced = (seg_idx is None)
-        return SegArray(eris.get_integral(key), seg_idx, seg_spin, label=arr_label, debug=debug, reduced=reduced)
+    _get_integral = partial(mpi_uccsd.get_integral_from_eris, eris=eris, debug=debug)
 
     fooa = eris.focka[:nocca,:nocca]
     fova = eris.focka[:nocca,nocca:]
@@ -429,9 +417,8 @@ def make_intermediates(cc, t1, t2, eris, checkpoint: int | None = None):
     return imds
 
 
-def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None):
-    """"""
-
+def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
+                  return_segarray: bool = False):
     log = logger.Logger(cc.stdout, cc.verbose)
 
     debug = (cc.verbose >= logger.DEBUG2)
@@ -450,15 +437,7 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
 
     _fntp = partial(mpi_uccsd.transpose_sz, nvira_or_vlocsa=vlocs_a, nvirb_or_vlocsb=vlocs_b)
     _einsum = partial(mpi_uccsd.einsum_sz, nvira_or_vlocsa=vlocs_a, nvirb_or_vlocsb=vlocs_b)
-    def _get_integral(key: str) -> SegArray:
-        seg_idx, seg_spin = None, None
-        arr_label = "eris." + key.replace('x', 'v').replace('X', 'V')
-        for k in 'xX':
-            if k in key:
-                seg_idx, seg_spin = key.index(k), 'xX'.index(k)
-                break
-        reduced = (seg_idx is None)
-        return SegArray(eris.get_integral(key), seg_idx, seg_spin, label=arr_label, debug=debug, reduced=reduced)
+    _get_integral = partial(mpi_uccsd.get_integral_from_eris, eris=eris, debug=debug)
 
     u1a, u1b = np.zeros_like(t1a), np.zeros_like(t1b)
     u1a0, u1b0 = np.zeros_like(t1a), np.zeros_like(t1b)
@@ -485,6 +464,18 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
              tau_ooxv, tau_oOxV, tau_OOXV)
     t2_ooxv, t2_oOxV, t2_OOXV, l2_ooxv, l2_oOxV, l2_OOXV, u2_ooxv, u2_oOxV, u2_OOXV, m3aa, m3ab, m3bb, tau_ooxv, tau_oOxV, tau_OOXV = [
         SegArray(arr, 2, seg_spin, label, debug=debug) for arr, seg_spin, label in zip(arrs, seg_spins, labels)]
+
+    if checkpoint == 4:
+        return dict(
+            t2aa=t2_ooxv.collect().data,
+            t2bb=t2_OOXV.collect().data,
+            t2ab=t2_oOxV.collect().data,
+            l2aa=l2_ooxv.collect().data,
+            l2bb=l2_OOXV.collect().data,
+            l2ab=l2_oOxV.collect().data,
+            m3aa=m3aa.collect().data,
+            m3bb=m3bb.collect().data,
+            m3ab=m3ab.collect().data)
 
     labels = ('t1a', 't1b', 'l1a', 'l1b', 'u1a0', 'u1b0', 'u1a', 'u1b')
     reduced = (True, True, True, True, True, True, False, False)
@@ -523,9 +514,13 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     m3ab += _einsum('kLaB,ikJL->iJaB', l2_oOxV, imds.wooOO)
 
     if checkpoint == 5:
-        return dict(m3aa=m3aa.collect().data,
-                    m3bb=m3bb.collect().data,
-                    m3ab=m3ab.collect().data)
+        return dict(
+            mvv=mvv.data, mVV=mVV.data,
+            moo=moo.data, mOO=mOO.data,
+            m3aa=m3aa.collect().data,
+            m3bb=m3bb.collect().data,
+            m3ab=m3ab.collect().data,
+            v2a=v2a.data)
 
     oxov, OXOV, oxOV = map(_get_integral, ("oxov", "OXOV", "oxOV"))
     oxov = _fntp(oxov, 1, 3, 1.0, -1.0)
@@ -556,9 +551,9 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
         m3bb -= _einsum('kbca,ijck->ijab', OXVV, tmp)
 
         tmp = _einsum('ic,jbca->jiba', l1b, OXVV)
-        tmp+= _einsum('kiab,jk->ijab', l2_OOXV, v2b)
-        tmp-= _einsum('ik,kajb->ijab', mOO1, OXOV)
-        u2_OOXV += tmp - tmp.transpose(1,0,2,3)
+        tmp += _einsum('kiab,jk->ijab', l2_OOXV, v2b)
+        tmp -= _einsum('ik,kajb->ijab', mOO1, OXOV)
+        u2_OOXV += tmp - tmp.transpose(1, 0, 2, 3)
         u1_OX += _einsum('iaCB,BC->ia', OXVV, mVV1)   # [a],...->[a]
         OXVV = tmp = None
 
@@ -577,23 +572,31 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
 
     if nvira > 0 and noccb > 0:
         oxVV = _get_integral("oxVV")
-        tmp = _einsum('iJdC,kd->iJCk', l2_oOxV, t1a[:, slc_va])
-        m3ab -= _einsum('kaCB,iJCk->iJaB', oxVV, tmp)
-
+        tmp = SegArray(np.zeros((nocca, noccb, nvirb_seg, nocca)), seg_idx=2, seg_spin=1, label='tmp', debug=debug)
+        tmp += _einsum('iJdC,kd->iJCk', l2_oOxV, t1_ox, out=tmp)    # [d]C,[d]->[C]
+        m3ab -= _einsum('kaCB,iJCk->iJaB', oxVV, tmp, out=m3ab)     # [a]C,C->[a]
         tmp = _einsum('IC,jbCA->jIbA', l1b, oxVV).set(label='tmp', debug=debug)
         tmp -= _einsum('iKaB,JK->iJaB', l2_oOxV, v2b)
         tmp -= _einsum('ik,kaJB->iJaB', moo1, oxOV)
         u2_oOxV += tmp
-        u1a += _einsum('iaCB,BC->ia', oxVV, mVV1)
+        u1_ox += _einsum('iaCB,BC->ia', oxVV, mVV1)
         oxVV = tmp = None
 
+    if checkpoint == 10:
+        return dict(
+            u2aa=u2_ooxv.collect().data,
+            u2bb=u2_OOXV.collect().data,
+            u2ab=u2_oOxV.collect().data,
+            u1a = u1a0.data + u1_ox.collect().data + u1a.collect().data,
+            u1b = u1b0.data + u1_OX.collect().data + u1b.collect().data,
+        )
 
     oxov, OXOV, oxOV = map(_get_integral, ("oxov", "OXOV", "oxOV"))
 
     tmp = _einsum('ijcd,klcd->ijkl', l2_ooxv, tau_ooxv).collect().set(label='tmp', debug=debug)
     oxov = _fntp(oxov, 1, 3, 1.0, -1.0)
     m3aa += _einsum('kalb,ijkl->ijab', oxov, tmp) * .25
-
+ 
     tmp = _einsum('ijcd,klcd->ijkl', l2_OOXV, tau_OOXV).collect().set(label='tmp', debug=debug)
     OXOV = _fntp(OXOV, 1, 3, 1.0, -1.0)
     m3bb += _einsum('kalb,ijkl->ijab', OXOV, tmp) * .25
@@ -615,6 +618,20 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     u2_OOXV += OXOV.transpose(0, 2, 1, 3)
     u2_oOxV += oxOV.transpose(0, 2, 1, 3)
 
+    if checkpoint == 15:
+        return dict(
+            ovOV=oxOV.collect().data,
+            tmp=tmp.collect().data,
+            m3aa=m3aa.collect().data,
+            m3bb=m3bb.collect().data,
+            m3ab=m3ab.collect().data,
+            u2aa=u2_ooxv.collect().data,
+            u2bb=u2_OOXV.collect().data,
+            u2ab=u2_oOxV.collect().data,
+            u1a = u1a0.data + u1_ox.collect().data + u1a.collect().data,
+            u1b = u1b0.data + u1_OX.collect().data + u1b.collect().data,
+        )
+
     # PYSCF L429-L435
     fov1 = _einsum('kcjb,kc->jb', oxov, t1_ox).collect().set(label='fov1aa') + fova
     fov1 += _einsum('jbKC,KC->jb', oxOV, t1b).collect()     # j[b]
@@ -634,6 +651,21 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     tmp = tmp - tmp.transpose(1, 0, 2, 3)
     u2_OOXV += tmp - tmp.transpose(0, 1, 3, 2)
 
+    fov1 = _einsum('kcjb,kc->jb', OXOV, t1_OX).set(label='fov1bb')
+    fov1 += _einsum('kcJB,kc->JB', oxOV, t1_ox)
+    fov1 = fov1.collect() + fovb
+
+    u2_oOxV += _einsum('ia,JB->iJaB', l1_ox, fov1)
+    u2_oOxV += _einsum('iKaC,JBCK->iJaB', l2_oOxV, imds.wOVXO)  # [a]C,[C]->[a]
+    u2_oOxV += _einsum('kIaC,jBCk->jIaB', l2_oOxV, imds.woVXo)  # [a]C,[C]->[a]
+    u2_oOxV += _einsum('kica,JBck->iJaB', l2_ooxv, imds.wOVxo, out=u2_oOxV)  # [c]a,[c]->[a]
+    u2_oOxV += _einsum('iKcA,JbcK->iJbA', l2_oOxV, imds.wOvxO, out=u2_oOxV)  # [c],b[c]->[b]
+
+    fov1 = _einsum('kcjb,kc->jb', oxov, t1_ox).collect().set(label='fov1aa') + fova
+    fov1 += _einsum('jbKC,KC->jb', oxOV, t1b).collect()
+    u2_oOxV += _einsum('ia,jb->jiba', l1b, fov1[:, slc_va])
+    u2_oOxV += _einsum('kIcA,jbck->jIbA', l2_oOxV, imds.wovxo, out=u2_oOxV)  # [c],b[c]->[b]
+    u2_oOxV += _einsum('KICA,jbCK->jIbA', l2_OOXV, imds.woxVO)  # [C],b[C]->[b]
 
     # pyscf L458-L477
     oxoo, OXOO, OXoo, oxOO = map(_get_integral, ("oxoo", "OXOO", "OXoo", "oxOO"))
@@ -644,18 +676,30 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     tmp+= _einsum('ijca,cb->ijab', l2_ooxv, v1a[slc_va], out=tmp)  # [c]a,[c]->[a]
     tmp+= _einsum('ca,icjb->ijab', mvv1[:, slc_va], oxov, out=tmp)
     u2_ooxv -= tmp - tmp.transpose(0, 1, 3, 2)
-    tmp = _einsum('ka,jbik->ijab', l1b[:, slc_vb], OXOO)
-    tmp+= _einsum('ijca,cb->ijab', l2_OOXV, v1b[slc_vb], out=tmp)
-    tmp+= _einsum('ca,icjb->ijab', mVV1[:, slc_vb], OXOV, out=tmp)
+
+    tmp = _einsum('ka,jbik->ijab', l1b[:, slc_vb], OXOO).set(label='tmp', debug=debug)    # [a],[b]->[a]bb
+    tmp += _einsum('ijca,cb->ijab', l2_OOXV, v1b[slc_vb], out=tmp)  # [c]a,[c]->[a]
+    tmp += _einsum('ca,icjb->ijab', mVV1[:, slc_vb], OXOV, out=tmp) # c[a],[c]->[a]
     u2_OOXV -= tmp - tmp.transpose(0, 1, 3, 2)
 
-    u2_oOxV -= _einsum('ka,JBik->iJaB', l1a[:, slc_va], OXoo, out=u2_oOxV)
-    u2_oOxV += _einsum('iJaC,CB->iJaB', l2_oOxV, v1b)
-    u2_oOxV -= _einsum('ca,icJB->iJaB', mvv1[slc_va], oxOV, out=u2_oOxV)
-    u2_oOxV -= _einsum('KA,ibJK->iJbA', l1b, oxOO)
-    u2_oOxV += _einsum('iJcA,cb->iJbA', l2_oOxV, v1a[slc_va], out=u2_oOxV)
-    u2_oOxV -= _einsum('CA,ibJC->iJbA', mVV1, oxOV)
+    u2_oOxV -= _einsum('ka,JBik->iJaB', l1_ox, OXoo, out=u2_oOxV)   # [a],[B]->[a]B
+    u2_oOxV += _einsum('iJaC,CB->iJaB', l2_oOxV, v1b)   # [a],...->[a]
+    u2_oOxV -= _einsum('ca,icJB->iJaB', mvv1[slc_va], oxOV, out=u2_oOxV)    # [c]a,[c]->[a]
+    u2_oOxV -= _einsum('KA,ibJK->iJbA', l1b, oxOO)  # ...,[b]->[b]
+    u2_oOxV += _einsum('iJcA,cb->iJbA', l2_oOxV, v1a[slc_va], out=u2_oOxV)  # [c],[c]b->[b]
+    u2_oOxV -= _einsum('CA,ibJC->iJbA', mVV1, oxOV) # ...,[b]->[b]
 
+    if checkpoint == 20:
+        return dict(
+            v1a=v1a.data, v1b=v1b.data,
+            mvv1=mvv1.data,
+            mVV1=mVV1.data,
+            u2aa=u2_ooxv.collect().data,
+            u2bb=u2_OOXV.collect().data,
+            u2ab=u2_oOxV.collect().data,
+            u1a = u1a0.data + u1_ox.collect().data + u1a.collect().data,
+            u1b = u1b0.data + u1_OX.collect().data + u1b.collect().data,
+        )
 
     # PySCF L478-L506
 
@@ -667,12 +711,12 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     u1b0 -= _einsum('ja,ij->ia', l1b, v2b)
 
     ovxo, ooxv, oxVO, OVXO, OOXV, OVxo = map(_get_integral, ("ovxo", "ooxv", "oxVO", "OVXO", "OOXV", "OVxo"))
-    u1a += _einsum('jb,iabj->ia', l1_ox, ovxo)
-    u1a -= _einsum('jb,ijba->ia', l1_ox, ooxv)
+    u1a += _einsum('jb,iabj->ia', l1_ox, ovxo)    # [b],[b]->...
+    u1a -= _einsum('jb,ijba->ia', l1_ox, ooxv)    # [b],[b]->...
     u1_ox += _einsum('JB,iaBJ->ia', l1b, oxVO)    # ...,[a]->[a]
-    u1b += _einsum('jb,iabj->ia', l1_OX, OVXO)
-    u1b -= _einsum('jb,ijba->ia', l1_OX, OOXV)
-    u1b += _einsum('jb,iabj->ia', l1_ox, OVxo)
+    u1b += _einsum('jb,iabj->ia', l1_OX, OVXO)    # [b],[b]->...
+    u1b -= _einsum('jb,ijba->ia', l1_OX, OOXV)    # [b],[b]->...
+    u1b += _einsum('jb,iabj->ia', l1_ox, OVxo)    # [b],[b]->...
 
     u1a -= _einsum('kjca,ijck->ia', l2_ooxv, imds.wooxo)
     u1_ox -= _einsum('jKaC,ijCK->ia', l2_oOxV, imds.wooXO)    # [a]C,[C]->[a]
@@ -680,7 +724,7 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     u1b -= _einsum('kJcA,IJck->IA', l2_oOxV, imds.wOOxo)      # [c],[c]->...
 
     u1a -= _einsum('ikbc,back->ia', l2_ooxv, imds.wvvxo)    # [b]c,b[c]->
-    u1a -= _einsum('iKbC,baCK->ia', l2_oOxV, imds.wvxVO)    # [b],b[a]->[a]
+    u1_ox -= _einsum('iKbC,baCK->ia', l2_oOxV, imds.wvxVO)    # [b],b[a]->[a]
     u1b -= _einsum('IKBC,BACK->IA', l2_OOXV, imds.wVVXO)    # [B]C,B[C]->...
     u1b -= _einsum('kIcB,BAck->IA', l2_oOxV, imds.wVVxo)    # c,c->...
 
@@ -689,7 +733,7 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     u1b += _einsum('JIBA,BJ->IA', l2_OOXV, imds.w3b[slc_vb])    # [B],[B]->...
     u1b += _einsum('jIbA,bj->IA', l2_oOxV, imds.w3a[slc_va])    # [b],[b]->...
 
-    tmpa  = t1a + _einsum('kc,kjcb->jb', l1_ox, t2_ooxv).collect()  #jb
+    tmpa  = t1a + _einsum('kc,kjcb->jb', l1_ox, t2_ooxv).collect()  #[c],[c]->...
     tmpa += _einsum('KC,jKbC->jb', l1b, t2_oOxV).collect()    #j[b]
     tmpa -= _einsum('bd,jd->jb', mvv1, t1a) # rd
     tmpa -= _einsum('lj,lb->jb', moo, t1a)  # rd
@@ -701,6 +745,25 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     tmpb -= _einsum('bd,jd->jb', mVV1, t1b) # rd
     tmpb -= _einsum('lj,lb->jb', mOO, t1b) # rd
 
+    if checkpoint == 25:
+        return dict(
+            woovo=imds.wooxo.collect().data,
+            wooVO=imds.wooXO.collect().data,
+            wOOvo=imds.wOOxo.collect().data,
+            wOOVO=imds.wOOXO.collect().data,
+            wvvvo=imds.wvvxo.collect().data,
+            tmpa=tmpa.data, tmpb=tmpb.data,
+            v1a=v1a.data, v1b=v1b.data,
+            v2a=v2a.data, v2b=v2b.data,
+            w3a=imds.w3a.data,
+            w3b=imds.w3b.data,
+            u2aa=u2_ooxv.collect().data,
+            u2bb=u2_OOXV.collect().data,
+            u2ab=u2_oOxV.collect().data,
+            u1a = u1a0.data + u1_ox.collect().data + u1a.collect().data,
+            u1b = u1b0.data + u1_OX.collect().data + u1b.collect().data,
+        )
+
     u1a += _einsum('jbia,jb->ia', oxov, tmpa[:, slc_va])    # [b],[b]->...
     u1_ox += _einsum('iaJB,JB->ia', oxOV, tmpb)       # [A],...->[A]
     u1b += _einsum('jbia,jb->ia', OXOV, tmpb[:, slc_vb])    # [b],[b]->...
@@ -711,20 +774,42 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     u1_OX -= _einsum('iajk,kj->ia', OXOO, mOO1)   # I[A]
     u1_OX -= _einsum('IAjk,kj->IA', OXoo, moo1)   # I[A]
 
-    tmp  = -_einsum('kbja,jb->ka', oxov, t1_ox).collect() + fova  # ka
+    if checkpoint == 30:
+        return dict(
+            u2aa=u2_ooxv.collect().data,
+            u2bb=u2_OOXV.collect().data,
+            u2ab=u2_oOxV.collect().data,
+            u1a = u1a0.data + u1_ox.collect().data + u1a.collect().data,
+            u1b = u1b0.data + u1_OX.collect().data + u1b.collect().data,
+        )
+
+    tmp  = -_einsum('kbja,jb->ka', oxov, t1_ox).collect().set(label='tmp') + fova  # ka
     tmp += _einsum('kaJB,JB->ka', oxOV, t1b).collect()    # k[a]
     u1a0 -= _einsum('ik,ka->ia', moo, tmp)   # rd
     u1a0 -= _einsum('ca,ic->ia', mvv, tmp)   # rd
-    tmp  = - _einsum('kbja,jb->ka', OXOV, t1_OX).collect() + fovb # ka
+    tmp  = - _einsum('kbja,jb->ka', OXOV, t1_OX).collect().set(label='tmp') + fovb # ka
     tmp += _einsum('jbKA,jb->KA', oxOV, t1_ox).collect() # [K]A
     u1b0 -= _einsum('ik,ka->ia', mOO, tmp)   # rd
     u1b0 -= _einsum('ca,ic->ia', mVV, tmp)   # rd
 
-    u1a = u1a0 + u1a.collect() + u1_ox.collect()
-    u1b = u1b0 + u1b.collect() + u1_OX.collect()
-
     eia = lib.direct_sum('i-j->ij', mo_ea_o, mo_ea_v)
     eIA = lib.direct_sum('i-j->ij', mo_eb_o, mo_eb_v)
+
+    if checkpoint == 35:
+        return dict(
+            tmp=tmp.data,
+            mOO=mOO.data,
+            mVV=mVV.data,
+            u2aa=u2_ooxv.collect().data,
+            u2bb=u2_OOXV.collect().data,
+            u2ab=u2_oOxV.collect().data,
+            u1a = u1a0.data + u1_ox.collect().data + u1a.collect().data,
+            u1b = u1b0.data + u1_OX.collect().data + u1b.collect().data,
+            eia=eia, eIA=eIA,
+        )
+
+    u1a = (u1a0 + u1_ox) + u1a
+    u1b = (u1b0 + u1_OX) + u1b
     u1a /= eia
     u1b /= eIA
 
@@ -732,4 +817,33 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None)
     u2_oOxV /= lib.direct_sum('ia+jb->ijab', eia[:, slc_va], eIA)
     u2_OOXV /= lib.direct_sum('ia+jb->ijab', eIA[:, slc_vb], eIA)
 
-    return (u1a.data, u1b.data), (u2_ooxv.data, u2_oOxV.data, u2_OOXV.data)
+    if checkpoint == 36:
+        return dict(u1a=u1a.data, u1b=u1b.data,
+                    u2aa=u2_ooxv.collect().data,
+                    u2bb=u2_OOXV.collect().data,
+                    u2ab=u2_oOxV.collect().data)
+
+    if checkpoint is None:
+        if return_segarray:
+            return (u1a, u1b), (u2_ooxv, u2_oOxV, u2_OOXV)
+        else:
+            l1new = (u1a.data, u1b.data)
+            l2new = (u2_ooxv.data, u2_oOxV.data, u2_OOXV.data)
+            return l1new, l2new
+
+
+def kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
+           max_cycle=50, tol=1e-8, verbose=logger.INFO,
+           fintermediates=None, fupdate=None):
+    if eris is None:
+        mycc.ao2mo()
+        eris = mycc._eris
+
+    if t1 is None: t1 = mycc.t1
+    if t2 is None: t2 = mycc.t2
+    if l1 is None: l1 = t1
+    if l2 is None: l2 = t2
+    if fintermediates is None:
+        fintermediates = make_intermediates
+    if fupdate is None:
+        fupdate = update_lambda

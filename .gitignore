@@ -98,3 +98,6 @@ ENV/
 
 # .npy
 *.npy
+
+# cProfile data
+*.prof

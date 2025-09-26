@@ -360,7 +360,6 @@ def update_amps_checkpoint_serial(cc, t1, t2, eris, checkpoint: int | None = Non
     return t1new, t2new
 
 
-# l2, t2 as ijab
 def make_intermediates_checkpoint_serial(mycc, t1, t2, eris, checkpoint=10):
     import numpy
     from pyscf.lib import einsum
@@ -615,11 +614,11 @@ def make_intermediates_checkpoint_serial(mycc, t1, t2, eris, checkpoint=10):
         )
 
 
-# update L1, L2
 def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint: int = 5):
     from pyscf.lib import logger, einsum
     import numpy
     from pyscf import lib
+    from pyscf.cc import uccsd
 
     time0 = logger.process_clock(), logger.perf_counter()
     log = logger.Logger(mycc.stdout, mycc.verbose)
@@ -658,6 +657,13 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
 
     #m3 = lib.einsum('ijcd,cdab->ijab', l2, eris.vvvv) * .5
     m3aa, m3ab, m3bb = mycc._add_vvvv(None, (l2aa.conj(),l2ab.conj(),l2bb.conj()), eris)
+
+    if checkpoint == 4:
+        return dict(
+            t2aa=t2aa, t2ab=t2ab, t2bb=t2bb,
+            l2aa=l2aa, l2ab=l2ab, l2bb=l2bb,
+            m3aa=m3aa, m3ab=m3ab, m3bb=m3bb)
+
     m3aa = m3aa.conj()
     m3ab = m3ab.conj()
     m3bb = m3bb.conj()
@@ -666,7 +672,10 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
     m3ab += lib.einsum('kLaB,ikJL->iJaB', l2ab, numpy.asarray(imds.wooOO))
 
     if checkpoint == 5:
-        return dict(m3aa=m3aa, m3ab=m3ab, m3bb=m3bb)
+        return dict(
+            mvv=mvv, mVV=mVV, moo=moo, mOO=mOO,
+            m3aa=m3aa, m3ab=m3ab, m3bb=m3bb,
+            v2a=v2a)
 
     ovov = numpy.asarray(eris.ovov)
     ovov = ovov - ovov.transpose(0,3,2,1)
@@ -677,6 +686,7 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
     mVV1 = einsum('jc,jb->bc', l1b, t1b) + mVV
     moo1 = einsum('ic,kc->ik', l1a, t1a) + moo
     mOO1 = einsum('ic,kc->ik', l1b, t1b) + mOO
+
     if nvira > 0 and nocca > 0:
         ovvv = numpy.asarray(eris.get_ovvv())
         ovvv = ovvv - ovvv.transpose(0,3,2,1)
@@ -727,6 +737,12 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
         u1a += numpy.einsum('iaCB,BC->ia', ovVV, mVV1)
         ovVV = tmp = None
 
+    if checkpoint == 10:
+        return dict(
+            u2aa=u2aa, u2bb=u2bb, u2ab=u2ab,
+            u1a=u1a, u1b=u1b,
+        )
+
     tauaa, tauab, taubb = uccsd.make_tau(t2, t1, t1)
     tmp = lib.einsum('ijcd,klcd->ijkl', l2aa, tauaa)
     ovov = numpy.asarray(eris.ovov)
@@ -755,6 +771,13 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
     u2aa += ovov.transpose(0,2,1,3)
     u2bb += OVOV.transpose(0,2,1,3)
     u2ab += ovOV.transpose(0,2,1,3)
+
+    if checkpoint == 15:
+        return dict(
+            tmp=tmp, ovOV=ovOV,
+            m3aa=m3aa, m3ab=m3ab, m3bb=m3bb,
+            u2aa=u2aa, u2bb=u2bb, u2ab=u2ab,
+            u1a=u1a, u1b=u1b)
 
     fov1 = fova + numpy.einsum('kcjb,kc->jb', ovov, t1a)
     fov1+= numpy.einsum('jbKC,KC->jb', ovOV, t1b)
@@ -794,17 +817,24 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
     tmp = einsum('ka,jbik->ijab', l1a, ovoo)
     tmp+= einsum('ijca,cb->ijab', l2aa, v1a)
     tmp+= einsum('ca,icjb->ijab', mvv1, ovov)
-    u2aa -= tmp - tmp.transpose(0,1,3,2)
+    u2aa -= tmp - tmp.transpose(0, 1, 3, 2)
     tmp = einsum('ka,jbik->ijab', l1b, OVOO)
     tmp+= einsum('ijca,cb->ijab', l2bb, v1b)
     tmp+= einsum('ca,icjb->ijab', mVV1, OVOV)
-    u2bb -= tmp - tmp.transpose(0,1,3,2)
+    u2bb -= tmp - tmp.transpose(0, 1, 3, 2)
     u2ab -= einsum('ka,JBik->iJaB', l1a, OVoo)
     u2ab += einsum('iJaC,CB->iJaB', l2ab, v1b)
     u2ab -= einsum('ca,icJB->iJaB', mvv1, ovOV)
     u2ab -= einsum('KA,ibJK->iJbA', l1b, ovOO)
     u2ab += einsum('iJcA,cb->iJbA', l2ab, v1a)
     u2ab -= einsum('CA,ibJC->iJbA', mVV1, ovOV)
+
+    if checkpoint == 20:
+        return dict(
+            v1a=v1a, v1b=v1b,
+            mvv1=mvv1, mVV1=mVV1,
+            u2aa=u2aa, u2bb=u2bb, u2ab=u2ab,
+            u1a=u1a, u1b=u1b)
 
     u1a += fova
     u1b += fovb
@@ -843,6 +873,20 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
     tmpb += numpy.einsum('kc,kJcB->JB', l1a, t2ab)
     tmpb -= einsum('bd,jd->jb', mVV1, t1b)
     tmpb -= einsum('lj,lb->jb', mOO, t1b)
+
+    if checkpoint == 25:
+        return dict(
+            woovo=imds.woovo,
+            wooVO=imds.wooVO,
+            wOOVO=imds.wOOVO,
+            wOOvo=imds.wOOvo,
+            wvvvo=imds.wvvvo,
+            tmpa=tmpa, tmpb=tmpb,
+            w3a=imds.w3a, w3b=imds.w3b,
+            v1a=v1a, v1b=v1b, v2a=v2a, v2b=v2b,
+            u2aa=u2aa, u2bb=u2bb, u2ab=u2ab,
+            u1a=u1a, u1b=u1b)
+
     u1a += numpy.einsum('jbia,jb->ia', ovov, tmpa)
     u1a += numpy.einsum('iaJB,JB->ia', ovOV, tmpb)
     u1b += numpy.einsum('jbia,jb->ia', OVOV, tmpb)
@@ -852,6 +896,11 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
     u1a -= numpy.einsum('iaJK,KJ->ia', ovOO, mOO1)
     u1b -= numpy.einsum('iajk,kj->ia', OVOO, mOO1)
     u1b -= numpy.einsum('IAjk,kj->IA', OVoo, moo1)
+
+    if checkpoint == 30:
+        return dict(
+            u2aa=u2aa, u2bb=u2bb, u2ab=u2ab,
+            u1a=u1a, u1b=u1b)
 
     tmp  = fova - numpy.einsum('kbja,jb->ka', ovov, t1a)
     tmp += numpy.einsum('kaJB,JB->ka', ovOV, t1b)
@@ -864,12 +913,27 @@ def update_lambda_checkpoint_serial(mycc, t1, t2, l1, l2, eris, imds, checkpoint
 
     eia = lib.direct_sum('i-j->ij', mo_ea_o, mo_ea_v)
     eIA = lib.direct_sum('i-j->ij', mo_eb_o, mo_eb_v)
+
+    if checkpoint == 35:
+        return dict(
+            tmp=tmp, mOO=mOO, mVV=mVV,
+            u2aa=u2aa, u2bb=u2bb, u2ab=u2ab,
+            u1a=u1a, u1b=u1b,
+            eia=eia, eIA=eIA,
+            )
+
     u1a /= eia
     u1b /= eIA
 
     u2aa /= lib.direct_sum('ia+jb->ijab', eia, eia)
     u2ab /= lib.direct_sum('ia+jb->ijab', eia, eIA)
     u2bb /= lib.direct_sum('ia+jb->ijab', eIA, eIA)
+
+    if checkpoint == 36:
+        return dict(
+            u1a=u1a, u1b=u1b,
+            u2aa=u2aa, u2ab=u2ab, u2bb=u2bb
+        )
 
     time0 = log.timer_debug1('update l1 l2', *time0)
     return (u1a,u1b), (u2aa,u2ab,u2bb)
@@ -953,6 +1017,18 @@ def test_update_amps(cc: UCCSD_MPI):
 
 
 @mpi.parallel_call
+def test_energy(cc: UCCSD_MPI):
+    max_cycle = 10
+    if getattr(cc, '_eris', None) is None:
+        cc.ao2mo(cc.mo_coeff)
+    _, t1, t2 = cc.init_amps()
+    for _ in range(max_cycle):
+        t1, t2 = cc.update_amps(t1, t2, cc._eris)
+    E = cc.energy(t1=t1, t2=t2, eris=cc._eris)
+    return E
+
+
+@mpi.parallel_call
 def test_lambda_intermediates_checkpoint(cc: UCCSD_MPI, checkpoint: int = 10):
     if getattr(cc, '_eris', None) is None:
         cc.ao2mo(cc.mo_coeff)
@@ -975,23 +1051,34 @@ def test_update_lambda_checkpoint(cc: UCCSD_MPI, checkpoint: int = 5):
     if getattr(cc, '_eris', None) is None:
         cc.ao2mo(cc.mo_coeff)
     _, t1, t2 = cc.init_amps()
-    t1, t2 = cc.update_amps(t1, t2, cc._eris)
     l1, l2 = t1, t2
     imds = uccsd_lambda_mpi.make_intermediates(cc, t1, t2, cc._eris)
-    res = uccsd_lambda_mpi.update_lambda(cc, t1, t2, l1, l2, cc._eris, imds, checkpoint=checkpoint)
-    return res
+    res = uccsd_lambda_mpi.update_lambda(
+        cc, t1, t2, l1, l2, cc._eris, imds, checkpoint=checkpoint)
+    imds = {k.replace('x', 'v').replace('X', 'V'): getattr(imds, k).collect().data for k in imds._keys}
+    return res, imds
 
 
 @mpi.parallel_call
 def test_update_lambda(cc: UCCSD_MPI):
+    return_segarray = True
     if getattr(cc, '_eris', None) is None:
         cc.ao2mo(cc.mo_coeff)
-    _, t1, t2 = cc.init_amps()
+    _, t10, t20 = cc.init_amps()
+    t1, t2 = cc.update_amps(t10, t20, cc._eris)
     t1, t2 = cc.update_amps(t1, t2, cc._eris)
-    l1, l2 = t1, t2
+    l1, l2 = t10, t20
     imds = uccsd_lambda_mpi.make_intermediates(cc, t1, t2, cc._eris)
-    (l1a, l1b), (l2aa, l2ab, l2bb) = uccsd_lambda_mpi.update_lambda(cc, t1, t2, l1, l2, cc._eris, imds)
-    res = dict(l1a=l1a, l1b=l1b)
-    for k, v in zip(('l2aa', 'l2ab', 'l2bb'), (l2aa, l2ab, l2bb)):
-        res[k] = cc_tools.collect_array(v, seg_idx=2)
+    l1new, l2new = uccsd_lambda_mpi.update_lambda(
+        cc, t1, t2, l1, l2, cc._eris, imds, checkpoint=None, return_segarray=return_segarray)
+    (l1a, l1b), (l2aa, l2ab, l2bb) = l1new, l2new
+    if return_segarray:
+        res = dict(l1a=l1a.data, l1b=l1b.data,
+                l2aa=l2aa.collect().data,
+                l2ab=l2ab.collect().data,
+                l2bb=l2bb.collect().data)
+    else:
+        res = dict(l1a=l1a, l1b=l1b)
+        for k, v in zip(('l2aa', 'l2ab', 'l2bb'), (l2aa, l2ab, l2bb)):
+            res[k] = cc_tools.collect_array(v, seg_idx=2)
     return res
