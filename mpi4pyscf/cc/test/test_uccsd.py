@@ -17,14 +17,8 @@ rank = mpi.rank
 comm = mpi.comm
 
 
-def get_scf_solver_O2():
-    mol = gto.Mole().set(
-        atom=[
-        [8 , (0., +2.000, 0.)],
-        [8 , (0., -2.000, 0.)],],
-        basis='cc-pvdz',
-        spin=0,
-    ).build()
+
+def get_scf_solver_mol(mol):
     mf = scf.UHF(mol).run()
     moa, mob = mf.mo_coeff
     nmoa, nmob = moa.shape[1], mob.shape[1]
@@ -45,11 +39,33 @@ def get_scf_solver_O2():
 
     assert nmoa == nmob
 
-    mf = UIHF(mol).set(verbose=4, get_hcore = lambda *args: np.array([h1a, h1b]),
-                       get_ovlp = lambda *args: np.array([np.eye(nmoa), np.eye(nmob)]))
+    mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: np.array([h1a, h1b]),
+                       get_ovlp=lambda *args: np.array([np.eye(nmoa), np.eye(nmob)]))
     mf._eri = (eri_aa, eri_bb, eri_ab)
     mf.kernel()
     return mf
+
+
+def get_scf_solver_O2():
+    mol = gto.Mole().set(
+        atom=[
+        [8 , (0., +2.000, 0.)],
+        [8 , (0., -2.000, 0.)],],
+        basis='cc-pvdz',
+        spin=0,
+    ).build()
+    return get_scf_solver_mol(mol)
+
+
+def get_scf_solver_S2():
+    mol = gto.Mole().set(
+        atom=[
+        [16 , (0., +2.700, 0.)],
+        [16 , (0., -2.700, 0.)],],
+        basis='cc-pvtz',
+        spin=0,
+    ).build()
+    return get_scf_solver_mol(mol)
 
 
 def get_scf_solver_model():
@@ -57,7 +73,18 @@ def get_scf_solver_model():
     h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
     mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
     mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: h1e,
-                       get_ovlp = lambda *args: ovlp)
+                       get_ovlp=lambda *args: ovlp)
+    mf._eri = eri
+    mf.kernel()
+    return mf
+
+
+def get_scf_solver_CCO():
+    f = h5py.File("/resnick/scratch/syuan/202509-svp/cco/k222-pyscfmkl/x0.00/UDMET-xcsc/ham_imp_0.h5", 'r')
+    h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
+    mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
+    mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: h1e,
+                       get_ovlp=lambda *args: ovlp)
     mf._eri = eri
     mf.kernel()
     return mf
@@ -284,22 +311,21 @@ def test_update_lambda(mf: UIHF):
 
 def test_ccsd_kernel(mf: UIHF):
     import cProfile, pstats
-    profile_filename = f"test_uccsd.prof"
 
     pr = cProfile.Profile()
     pr.enable()
-    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+    cc_mpi = UICCSD_MPI(mf).set(verbose=5, max_cycle=30)
     cc_mpi.kernel()
 
     pr.disable()
-    pr.dump_stats(profile_filename)
+    # pr.dump_stats(profile_filename)
 
     if rank == 0:
         stats = pstats.Stats(pr)
-        stats.sort_stats('cumulative').print_stats(60) # Print top 10 cumulative stats
+        stats.sort_stats('cumulative').print_stats(60)
 
     if rank == 0:
-        cc_ref = UICCSD(mf).set(verbose=5)
+        cc_ref = UICCSD(mf).set(verbose=5, max_cycle=30)
         cc_ref.kernel()
         diff = np.abs(cc_mpi.e_corr - cc_ref.e_corr)
         print(f"Difference of CCSD energy: {diff} / {np.abs(cc_ref.e_corr)} = {diff/np.abs(cc_ref.e_corr)}")
@@ -313,7 +339,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 3: chkpt = None
     else: chkpt = int(sys.argv[2])
 
-    mf = get_scf_solver_O2()
+    # mf = get_scf_solver_CCO()
+    mf = get_scf_solver_S2()
 
     if task == "eris": test_uiccsd_eris(mf)
     if task == "init_amps": test_init_amps(mf)

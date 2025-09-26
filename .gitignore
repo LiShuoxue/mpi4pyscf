@@ -101,3 +101,8 @@ ENV/
 
 # cProfile data
 *.prof
+
+# files for submitting jobs
+*.sh
+*.err
+*.out

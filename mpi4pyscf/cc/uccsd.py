@@ -8,7 +8,6 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from pyscf import lib, ao2mo, __config__
-from pyscf.cc import ccsd as pyscf_ccsd
 from pyscf.cc import uccsd as pyscf_uccsd
 
 from libdmet.utils.misc import take_eri, tril_take_idx
@@ -880,7 +879,7 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
     # pyscf L254-L262
     OOXV, OVXO = map(_get_integral, ('OOXV', 'OVXO'))
     wOVXO -= OOXV.transpose(0, 2, 3, 1)
-    wOVXO += OVXO.transpose(0, 2, 1, 3) # ??
+    wOVXO += OVXO.transpose(0, 2, 1, 3)
     OOXV -= OVXO.transpose(0, 3, 2, 1)
     u1_OX -= _einsum('NF,NIAF->IA', t1b, OOXV)
     tmp1bb = _einsum('IE,MJBE->MBIJ', t1b, OOXV).set(label='tmp1bb').collect()
@@ -983,10 +982,10 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
 
     u2_ooxv *= .5
     u2_OOXV *= .5
-    u2_ooxv = u2_ooxv - u2_ooxv.transpose(0,1,3,2)
-    u2_ooxv = u2_ooxv - u2_ooxv.transpose(1,0,2,3)
-    u2_OOXV = u2_OOXV - u2_OOXV.transpose(0,1,3,2)
-    u2_OOXV = u2_OOXV - u2_OOXV.transpose(1,0,2,3)
+    u2_ooxv = u2_ooxv - u2_ooxv.transpose(0, 1, 3, 2)
+    u2_ooxv = u2_ooxv - u2_ooxv.transpose(1, 0, 2, 3)
+    u2_OOXV = u2_OOXV - u2_OOXV.transpose(0, 1, 3, 2)
+    u2_OOXV = u2_OOXV - u2_OOXV.transpose(1, 0, 2, 3)
 
     eia_a = lib.direct_sum('i-a->ia', mo_ea_o, mo_ea_v)
     eia_b = lib.direct_sum('i-a->ia', mo_eb_o, mo_eb_v)
@@ -1235,16 +1234,16 @@ class UCCSD(pyscf_uccsd.UCCSD):
         return vector_to_amplitudes(vec, nmo, nocc)
 
     def ccsd(self, t1=None, t2=None, eris=None):
-        assert(self.mo_coeff is not None)
-        assert(self.mo_occ is not None)
+        assert (self.mo_coeff is not None)
+        assert (self.mo_occ is not None)
         if self.verbose >= logger.WARN:
             self.check_sanity()
         self.dump_flags()
 
         self.converged, self.e_corr, self.t1, self.t2 = \
-                mpi_rccsd.kernel(self, eris, t1, t2, max_cycle=self.max_cycle,
-                       tol=self.conv_tol, tolnormt=self.conv_tol_normt,
-                       verbose=self.verbose)
+            mpi_rccsd.kernel(self, eris, t1, t2, max_cycle=self.max_cycle,
+                             tol=self.conv_tol, tolnormt=self.conv_tol_normt,
+                             verbose=self.verbose)
         if rank == 0:
             self._finalize()
         return self.e_corr, self.t1, self.t2
