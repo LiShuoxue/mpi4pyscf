@@ -13,7 +13,8 @@ from mpi4pyscf.tools import mpi
 from mpi4pyscf.cc import uccsd as mpi_uccsd
 from mpi4pyscf.cc import cc_tools as tools
 from mpi4pyscf.cc.cc_tools import SegArray
-
+from mpi4pyscf.lib import diis
+from mpi4pyscf.cc.ccsd import _sync_, _diff_norm
 
 comm = mpi.comm
 rank = mpi.rank
@@ -832,18 +833,58 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
             return l1new, l2new
 
 
+@mpi.parallel_call(skip_args=[1], skip_kwargs=['eris'])
 def kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
            max_cycle=50, tol=1e-8, verbose=logger.INFO,
            fintermediates=None, fupdate=None):
-    if eris is None:
-        mycc.ao2mo()
-        eris = mycc._eris
+    log = logger.new_logger(mycc, verbose)
+    cput0 = (logger.process_clock(), logger.perf_counter())
+    _sync_(mycc)
 
     if t1 is None: t1 = mycc.t1
     if t2 is None: t2 = mycc.t2
-    if l1 is None: l1 = t1
-    if l2 is None: l2 = t2
+    if l1 is None:
+        if mycc.l1 is None: l1 = t1
+        else: l1 = mycc.l1
+    if l2 is None:
+        if mycc.l2 is None: l2 = t2
+        else: l2 = mycc.l2
+
+    eris = getattr(mycc, '_eris', None)
+    if eris is None:
+        mycc.ao2mo(mycc.mo_coeff)
+        eris = mycc._eris
+
     if fintermediates is None:
         fintermediates = make_intermediates
     if fupdate is None:
         fupdate = update_lambda
+
+    imds = fintermediates(mycc, t1, t2, eris)
+
+    if isinstance(mycc.diis, diis.DistributedDIIS):
+        adiis = mycc.diis
+    elif mycc.diis:
+        adiis = diis.DistributedDIIS(mycc, mycc.diis_file)
+        adiis.space = mycc.diis_space
+    else:
+        adiis = None
+    cput1 = log.timer('CCSD lambda initialization', *cput0)
+
+    conv = False
+    for istep in range(max_cycle):
+        l1new, l2new = fupdate(mycc, t1, t2, l1, l2, eris, imds)
+        normt = _diff_norm(mycc, l1new, l2new, l1, l2)
+        l1, l2 = l1new, l2new
+        l1new = l2new = None
+        l1, l2 = mycc.run_diis(l1, l2, istep, normt, 0, adiis)
+        log.info('cycle = %d  norm(lambda1,lambda2) = %.6g', istep+1, normt)
+        cput1 = log.timer('CCSD iter', *cput1)
+        if normt < tol:
+            conv = True
+            break
+
+    mycc.l1 = l1
+    mycc.l2 = l2
+    log.timer('CCSD lambda', *cput0)
+    return conv, l1, l2

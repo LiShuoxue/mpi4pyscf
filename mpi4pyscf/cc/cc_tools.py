@@ -30,7 +30,8 @@ def get_vlocs(nvir):
     return [_task_location(nvir, task_id) for task_id in range(ntasks)]
 
 
-def collect_array(arr: ArrayLike, seg_idx: int | None = None, debug: bool = False, sum_over: bool = True) -> ArrayLike:
+def collect_array(arr: ArrayLike, seg_idx: int | None = None, debug: bool = False,
+                  sum_over: bool = True, bcast: bool = True) -> ArrayLike:
     """
     For the segmented array, gather along the segmented indices;
     For the non-segmented array, return the sum for all the processes.
@@ -42,8 +43,10 @@ def collect_array(arr: ArrayLike, seg_idx: int | None = None, debug: bool = Fals
         ndim = arr.ndim
         tp = (seg_idx, ) + tuple(range(seg_idx)) + tuple(range(seg_idx+1, ndim))
         tp_inv = tuple(np.argsort(tp))
-        res = mpi.gather_new(arr.transpose(tp)).transpose(tp_inv)
-    res = mpi.bcast(res, root=0)
+        # res = mpi.gather_new(arr.transpose(tp)).transpose(tp_inv)
+        res = mpi.gather(arr.transpose(tp)).transpose(tp_inv)
+    if bcast:
+        res = mpi.bcast(res, root=0)
     return res
 
 
@@ -68,7 +71,8 @@ def get_mpi_array(arr_fn: callable, vlocs: list | None = None, seg_idx: int | No
             # print(f"In get_mpi_array: {[x.shape for x in arr_segs]}")
     else:
         arr, arr_segs = None, None
-    arr_seg = mpi.scatter_new(arr_segs, root=0)
+    arr_seg = mpi.scatter(arr_segs, root=0)
+    # arr_seg = mpi.scatter_new(arr_segs, root=0)
     arr, arr_segs = None, None
     return arr_seg
 
@@ -328,6 +332,40 @@ def _tuple_of_slices_to_str(slices: tuple) -> str:
     return "[" + ", ".join(_slice_to_str(s) for s in slices) + "]"
 
 
+def reseg_v2(arr: np.ndarray, idx_old: int, idx_new: int, vlocs_old: list, vlocs_new: list) -> np.ndarray:
+    """
+    Redo the segmentation along one index from old to new.
+    """
+    arr_shape = list(arr.shape)
+
+    v0_new, v1_new = vlocs_new[rank]
+    nvir_seg_new = v1_new - v0_new
+    slc_new = slice(v0_new, v1_new)
+    slc_new_rel = slice(0, nvir_seg_new)
+
+    arr_shape[idx_old] = vlocs_old[ntasks - 1][-1]
+    arr_shape[idx_new] = nvir_seg_new    
+    arr_shape = tuple(arr_shape)
+
+    res = np.zeros(arr_shape, dtype=arr.dtype)
+
+    min_idx, max_idx = min(idx_old, idx_new), max(idx_old, idx_new)
+
+    for _, arr, p0, p1 in _rotate_vir_block(arr, vlocs=vlocs_old):
+        nvir_seg_old = p1 - p0
+        slc_old = slice(p0, p1)
+        slc_old_rel = slice(0, nvir_seg_old)
+
+        if idx_old < idx_new:
+            slc_out = (slice(None), ) * min_idx + (slc_old, ) + (slice(None), ) * (max_idx - min_idx - 1) + (slc_new_rel, )
+            slc_in = (slice(None), ) * min_idx + (slc_old_rel, ) + (slice(None), ) * (max_idx - min_idx - 1) + (slc_new, )
+        else:
+            slc_out = (slice(None), ) * min_idx + (slc_new_rel, ) + (slice(None), ) * (max_idx - min_idx - 1) + (slc_old, )
+            slc_in = (slice(None), ) * min_idx + (slc_new, ) + (slice(None), ) * (max_idx - min_idx - 1) + (slc_old_rel, )
+        res[slc_out] += arr[slc_in]
+    return res
+
+
 def segmented_transpose(arr: ArrayLike, seg_idx: int, tp_idx: int, coeff_0: float, coeff: float,
                           vlocs: list, debug: bool = False) -> ArrayLike:
     """
@@ -404,14 +442,16 @@ class SegArray(lib.StreamObject):
 
     def __add__(self, other):
         """
+        Define the addition operation between two SegArrays.
         +---------+-----------+--------------------+
         | self    |  other    |  action            |
         +---------+-----------+--------------------+
-        | Any     | np        | add locally        |
+        | Any     | numpy     | add locally        |
         | R       | R         | add locally        |
         | R       | NR        | collect other, add |
-
-
+        | None    | None      | add locally        |
+        | S       | Any       | add/resegment      |
+        +---------+-----------+--------------------+
         """
         _o = other if isinstance(other, np.ndarray) else other.data
 
@@ -428,9 +468,14 @@ class SegArray(lib.StreamObject):
                 _o = other.data
             elif isinstance(self.seg_idx, int):     # self segmented and other does not have same segmented index
                 self.print_debug(f"    [SegArray:+] Seg{self.seg_idx} + Seg{other.seg_idx}")
-                _reduced_data = other.collect().data
-                vlocs = get_vlocs(_reduced_data.shape[self.seg_idx])
-                _o = get_mpi_array(lambda: _reduced_data, vlocs=vlocs, seg_idx=self.seg_idx, debug=self.debug)
+                if isinstance(other.seg_idx, int):
+                    _o = reseg_v2(other.data, other.seg_idx, self.seg_idx,
+                                    vlocs_old=get_vlocs(nvir=self.data.shape[other.seg_idx]),
+                                    vlocs_new=get_vlocs(nvir=other.data.shape[self.seg_idx]))
+                else:
+                    _reduced_data = other.collect().data
+                    vlocs = get_vlocs(_reduced_data.shape[self.seg_idx])
+                    _o = get_mpi_array(lambda: _reduced_data, vlocs=vlocs, seg_idx=self.seg_idx, debug=self.debug)
             else:   # self is not segmented
                 assert isinstance(other.seg_idx, int)
                 assert self.reduced

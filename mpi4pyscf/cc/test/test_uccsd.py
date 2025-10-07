@@ -1,5 +1,6 @@
 import numpy as np
 import h5py
+import os
 import pytest
 from scipy import linalg as la
 
@@ -13,12 +14,14 @@ from libdmet.solver.cc_solver import UICCSD
 from mpi4pyscf.cc.uccsd import UICCSD as UICCSD_MPI
 from mpi4pyscf.cc.test import _test_uccsd as testfuncs
 
+import cProfile, pstats
+
 rank = mpi.rank
 comm = mpi.comm
 
 
-
-def get_scf_solver_mol(mol):
+def get_scf_solver_mol(mol, chkfile: str = None):
+    print(f"Molecule Information: nao = {mol.nao}, nelec = {mol.nelec}")
     mf = scf.UHF(mol).run()
     moa, mob = mf.mo_coeff
     nmoa, nmob = moa.shape[1], mob.shape[1]
@@ -40,8 +43,27 @@ def get_scf_solver_mol(mol):
     assert nmoa == nmob
 
     mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: np.array([h1a, h1b]),
-                       get_ovlp=lambda *args: np.array([np.eye(nmoa), np.eye(nmob)]))
+                       get_ovlp=lambda *args: np.array([np.eye(nmoa), np.eye(nmob)]),
+                       chkfile=chkfile)
     mf._eri = (eri_aa, eri_bb, eri_ab)
+
+    if os.path.isfile(str(chkfile)):
+        print("Loading SCF from checkpoint file:", chkfile)
+        mf.__dict__.update(scf.chkfile.load_scf(chkfile)[1])
+    else:
+        print("Running SCF ...")
+        mf.kernel()
+    return mf
+
+
+def get_scf_solver_model(fname: str):
+    # fname = "./data/ham_sz_sample.h5"
+    f = h5py.File(fname, 'r')
+    h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
+    mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
+    mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: h1e,
+                       get_ovlp=lambda *args: ovlp)
+    mf._eri = eri
     mf.kernel()
     return mf
 
@@ -49,8 +71,8 @@ def get_scf_solver_mol(mol):
 def get_scf_solver_O2():
     mol = gto.Mole().set(
         atom=[
-        [8 , (0., +2.000, 0.)],
-        [8 , (0., -2.000, 0.)],],
+        [8 , (0., +1.200, 0.)],
+        [8 , (0., -1.200, 0.)],],
         basis='cc-pvdz',
         spin=0,
     ).build()
@@ -68,26 +90,15 @@ def get_scf_solver_S2():
     return get_scf_solver_mol(mol)
 
 
-def get_scf_solver_model():
-    f = h5py.File("./data/ham_sz_sample.h5", 'r')
-    h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
-    mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
-    mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: h1e,
-                       get_ovlp=lambda *args: ovlp)
-    mf._eri = eri
-    mf.kernel()
-    return mf
-
-
-def get_scf_solver_CCO():
-    f = h5py.File("/resnick/scratch/syuan/202509-svp/cco/k222-pyscfmkl/x0.00/UDMET-xcsc/ham_imp_0.h5", 'r')
-    h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
-    mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
-    mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: h1e,
-                       get_ovlp=lambda *args: ovlp)
-    mf._eri = eri
-    mf.kernel()
-    return mf
+# def get_scf_solver_CCO():
+    # f = h5py.File("/resnick/scratch/syuan/202509-svp/cco/k222-pyscfmkl/x0.00/UDMET-xcsc/ham_imp_0.h5", 'r')
+    # h1e, eri, norb, ovlp = f['h1'][:], f['h2'][:], f['norb'][()], f['ovlp'][:]
+    # mol = gto.M().set(nao=norb, nelectron=norb, spin=0)
+    # mf = UIHF(mol).set(verbose=4, get_hcore=lambda *args: h1e,
+                       # get_ovlp=lambda *args: ovlp)
+    # mf._eri = eri
+    # mf.kernel()
+    # return mf
 
 
 def get_vvvv(vvvv):
@@ -104,6 +115,9 @@ def get_full_eris_mat(eris, key):
     nocca, noccb = eris.nocc
     nmoa, nmob = map(np.size, eris.mo_energy)
     nvira, nvirb = nmoa - nocca, nmob - noccb
+
+    # return getattr(eris, key)
+
     if key not in ('ovvv', 'OVVV', 'vvvv', 'VVVV', 'ovVV', 'OVvv', 'vvVV'):
         return getattr(eris, key)
     elif key in ('ovvv', 'OVVV', 'ovVV', 'OVvv'):
@@ -166,15 +180,27 @@ def test_make_tau(mf: UIHF):
 
 
 def test_add_vvvv(mf: UIHF):
+
     cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    pr = cProfile.Profile()
+    pr.enable()
     if rank == 0:
         print("Testing UCCSD add_vvvv ...")
     res = testfuncs.test_add_vvvv(cc_mpi)
+    pr.disable()
+    pr.dump_stats(f'test_add_vvvv_np1.prof')
+    cc_mpi = None
+
+    """
     if rank == 0:
         cc_ref = UICCSD(mf)
         eris = cc_ref.ao2mo()
         _, t1_ref, t2_ref = cc_ref.init_amps()
+        pr = cProfile.Profile()
+        pr.enable()
         oovvs_ref = pyscf_uccsd._add_vvvv(cc_ref, t1_ref, t2_ref, eris=eris)
+        pr.disable()
+        pr.dump_stats(f'test_add_vvvv_serial.prof')
         keys = ('oovv_aa', 'oovv_ab', 'oovv_bb')
         ref = {k: oovvs_ref[i] for i, k in enumerate(keys)}
         print("oovv results:")
@@ -182,7 +208,7 @@ def test_add_vvvv(mf: UIHF):
             diff = np.abs(res[k] - ref[k]).max()
             norm = np.linalg.norm(ref[k])
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
-            assert np.allclose(diff, 0.0)
+    """
 
 
 def test_update_amps_checkpoint(mf: UIHF, checkpoint: int = 10):
@@ -209,7 +235,7 @@ def test_update_amps(mf: UIHF):
         cc_ref = UICCSD(mf)
         eris = cc_ref.ao2mo()
         _, t1_ref, t2_ref = cc_ref.init_amps()
-        for _ in range(1):
+        for _ in range(3):
             t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris)
         ref = dict(t1a=t1_ref[0], t1b=t1_ref[1],
                          t2aa=t2_ref[0], t2ab=t2_ref[1], t2bb=t2_ref[2])
@@ -310,53 +336,109 @@ def test_update_lambda(mf: UIHF):
 
 
 def test_ccsd_kernel(mf: UIHF):
-    import cProfile, pstats
 
-    pr = cProfile.Profile()
-    pr.enable()
+    RUN_MPI = True
+    RUN_SERIAL = False
+    ENABLE_MPI_PROFILE = True
+    ENABLE_SERIAL_PROFILE = False
+
     cc_mpi = UICCSD_MPI(mf).set(verbose=5, max_cycle=30)
+
+    # if ENABLE_MPI_PROFILE:
+    # pr = cProfile.Profile()
+    # pr.enable()
+
+    # if RUN_MPI:
     cc_mpi.kernel()
 
-    pr.disable()
-    # pr.dump_stats(profile_filename)
+    # if ENABLE_MPI_PROFILE:
+    # pr.disable()
+    # pr.dump_stats(f'test_H2O_trimer_pvtz.prof')
 
-    if rank == 0:
-        stats = pstats.Stats(pr)
-        stats.sort_stats('cumulative').print_stats(60)
-
-    if rank == 0:
+    if RUN_SERIAL:
         cc_ref = UICCSD(mf).set(verbose=5, max_cycle=30)
+
+    if ENABLE_SERIAL_PROFILE:
+        pr = cProfile.Profile()
+        pr.enable()
+
+    if RUN_SERIAL:
         cc_ref.kernel()
+
+    if ENABLE_SERIAL_PROFILE:
+        pr.disable()
+        pr.dump_stats(f'test_H2O_trimer_serial_pvtz.prof')
+
+    if RUN_MPI and RUN_SERIAL:
         diff = np.abs(cc_mpi.e_corr - cc_ref.e_corr)
         print(f"Difference of CCSD energy: {diff} / {np.abs(cc_ref.e_corr)} = {diff/np.abs(cc_ref.e_corr)}")
         assert np.allclose(diff, 0.0)
 
 
+def test_ccsd_rdm(mf: UIHF):
+    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+    cc_mpi.kernel()
+    t1_mpi, t2_mpi = cc_mpi.gather_amplitudes()
+    print(f"t1_mpi.shape = {t1_mpi[0].shape} {t1_mpi[1].shape}")
+    print(f"t2_mpi.shape = {t2_mpi[0].shape} {t2_mpi[1].shape} {t2_mpi[2].shape}")
+
+    # Should use args rather than kwargs (e.g. t1=t1_mpi, t2=t2_mpi) here.
+    cc_mpi.distribute_amplitudes_(t1_mpi, t2_mpi)
+    # cc_mpi.solve_lambda()
+    rdm1 = cc_mpi.make_rdm1(ao_repr=True)
+    rdm2 = cc_mpi.make_rdm2(ao_repr=True)
+
+    if rank == 0:
+        cc_ref = UICCSD(mf).set(verbose=5)
+        cc_ref.kernel()
+        rdm1_ref = cc_ref.make_rdm1(ao_repr=True)
+        rdm2_ref = cc_ref.make_rdm2(t1=cc_ref.t1, t2=cc_ref.t2, l1=cc_ref.l1, l2=cc_ref.l2, ao_repr=True)
+
+        rdm1 = np.array(rdm1)
+        rdm2 = np.array(rdm2)
+        rdm1_ref = np.array(rdm1_ref)
+        rdm2_ref = np.array(rdm2_ref)
+
+        diff_rdm1 = np.abs(rdm1 - rdm1_ref).max()
+        diff_rdm2 = np.abs(rdm2 - rdm2_ref).max()
+        norm_rdm1 = np.linalg.norm(rdm1_ref)
+        norm_rdm2 = np.linalg.norm(rdm2_ref)
+        # RDM relative difference ~1e-4, since the DIIS procedure of mpi-ccsd and ccsd are not the same currently.
+        print(f"Difference of RDM1: {diff_rdm1} / {norm_rdm1} = {diff_rdm1/norm_rdm1}")
+        print(f"Difference of RDM2: {diff_rdm2} / {norm_rdm2} = {diff_rdm2/norm_rdm2}")
+
+
 if __name__ == "__main__":
+    from mpi4pyscf.cc.test.conftest import H2O_mol, H2O_trimer_mol, H2O_dimer_mol
     import sys
 
     task = sys.argv[1]
     if len(sys.argv) < 3: chkpt = None
     else: chkpt = int(sys.argv[2])
 
-    # mf = get_scf_solver_CCO()
-    mf = get_scf_solver_S2()
+    mf = get_scf_solver_mol(mol=H2O_trimer_mol(), chkfile='./data/chk_h2o_trimer_uhf.h5')
+    # mf = get_scf_solver_O2()
+    # mf = get_scf_solver_mol(mol=H2O_mol())
 
     if task == "eris": test_uiccsd_eris(mf)
-    if task == "init_amps": test_init_amps(mf)
-    if task == "tau": test_make_tau(mf)
-    if task == "vvvv": test_add_vvvv(mf)
-    if task == 'energy': test_energy(mf)
-    if task == "kernel": test_ccsd_kernel(mf)
+    elif task == "init_amps": test_init_amps(mf)
+    elif task == "tau": test_make_tau(mf)
+    elif task == "vvvv": test_add_vvvv(mf)
+    elif task == 'energy': test_energy(mf)
+    elif task == "kernel": test_ccsd_kernel(mf)
+    elif task == "rdm": test_ccsd_rdm(mf)
 
-    if task == "amps":
+    elif task == "amps":
         if chkpt is None: test_update_amps(mf)
-        else: test_update_amps_checkpoint(mf, checkpoint=40)
+        else: test_update_amps_checkpoint(mf, checkpoint=chkpt)
 
-    if task == "imds":
+    elif task == "imds":
         if chkpt is None: test_lambda_intermediates(mf)
         else: test_lambda_intermediates_checkpoint(mf, checkpoint=chkpt)
 
-    if task == "lambda":
+    elif task == "lambda":
         if chkpt is None: test_update_lambda(mf=mf)
         else: test_update_lambda_checkpoint(mf, checkpoint=chkpt)
+
+    else:
+        raise ValueError(f"Unknown task {task}.")

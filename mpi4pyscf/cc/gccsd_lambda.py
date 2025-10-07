@@ -80,7 +80,7 @@ def kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
         mycc.l2 = l2
         conv = True
         return conv, l1, l2
-    
+
     eris = getattr(mycc, '_eris', None)
     if eris is None:
         mycc.ao2mo(mycc.mo_coeff)
@@ -88,7 +88,7 @@ def kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
 
     if fintermediates is None:
         fintermediates = make_intermediates
-    
+
     if fupdate is None:
         rk = comm.allreduce(getattr(mycc, "rk", None), op=mpi.MPI.LOR)
         if rk:

@@ -68,8 +68,40 @@ def test_basic_new():
             assert np.allclose(res, ref)
 
 
+def test_dgemm():
+    # NOTE dot test Correct.
+    from pyscf.lib.numpy_helper import _dgemm
+    m_tot, n_tot, k_tot = 200, 500, 300
+    a = np.asarray(np.random.random(size=(m_tot, k_tot)), order='C')
+    b = np.asarray(np.random.random(size=(k_tot, n_tot)), order='C')
+
+    ref = a @ b
+    blksize = 67
+
+    c = np.zeros((m_tot, n_tot), order='C')
+
+    for k0, k1 in lib.prange(0, k_tot, blksize):
+        kc = k1 - k0
+        _a = np.asarray(a[:, k0:k1], order='C')
+        for n0, n1 in lib.prange(0, n_tot, blksize):
+            nc = n1 - n0
+            _b = np.asarray(b[k0:k1, n0:n1], order='C')
+            _dgemm(trans_a='N', trans_b='N',
+                    m=m_tot, n=nc, k=kc,
+                    a=_a, b=_b, c=c,
+                    alpha=1., beta=1.,
+                    offseta=0, offsetb=0, offsetc=n0)
+
+    print("max diff of dgemm = ", np.abs(c - ref).max() / np.abs(ref).max())
+
+
+# def test_dgemm_#
+
+
+
 if __name__ == "__main__":
-    if rank == 0:
-        test_segd_einsum_type()
+    test_dgemm()
+    # if rank == 0:
+        # test_segd_einsum_type()
         # test_segarr_cls()
-    test_basic_new()
+    # test_basic_new()

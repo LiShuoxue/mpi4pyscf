@@ -909,7 +909,7 @@ class CCSD(ccsd.CCSD):
         """
         # ccsd.CCSD._finalize(self)
         # ZHC NOTE unregister the ccsd_obj
-        #self._release_regs()
+        # self._release_regs()
         return self
 
     _release_regs = _release_regs

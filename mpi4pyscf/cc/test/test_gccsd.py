@@ -94,11 +94,26 @@ def test_init_amps(mycc):
     print (t1_diff)
     assert t1_diff < 1e-7
 
+H2O_trimer_atom = f'''
+    O  8.70835e-01  6.24543e+00  5.08445e+00
+    H  8.51421e-01  6.33649e+00  6.05969e+00
+    H  1.66206e+00  5.60635e+00  5.02479e+00
+    O  2.38299e+00  8.36926e+00  4.10083e+00
+    H  1.76679e+00  7.63665e+00  4.17552e+00
+    H  2.40734e+00  8.80363e+00  4.99023e+00
+    O  2.41917e+00  1.04168e+01  2.48601e+00
+    H  2.55767e+00  9.70422e+00  3.12008e+00
+    H  3.10835e+00  1.02045e+01  1.83352e+00
+    '''
+H2O_trimer_basis = 'cc-pvdz'
+
+
 # genrate reference values
 mol = gto.M(
     atom = 'H 0 0 0; F 0 0 1.1',
     basis = '321g',
-    spin = 2)
+    spin = 2
+    )
 mol.verbose = 5
 mf = mol.GHF()
 hcoreX = mf.get_hcore()

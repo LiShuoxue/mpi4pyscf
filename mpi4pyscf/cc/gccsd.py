@@ -1065,7 +1065,7 @@ class GCCSD(gccsd.GCCSD):
         if self.verbose >= logger.WARN:
             self.check_sanity()
         self.dump_flags()
-        
+  
         if self.e_hf is None:
             self.e_hf = self._scf.e_tot
 
@@ -1166,7 +1166,7 @@ class GCCSD(gccsd.GCCSD):
         dm2[p,r,q,s] = <p^+ q^+ s r>
         '''
         return gccsd_rdm.make_rdm2(self, t1, t2, l1, l2, ao_repr=ao_repr)
-    
+
     #def ccsd_t(self, t1=None, t2=None, eris=None):
     #    from pyscf.cc import gccsd_t
     #    if t1 is None: t1 = self.t1
@@ -1525,7 +1525,7 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
                 eris.xvvv[p0-(nocc+vloc0):p1-(nocc+vloc0)] = eri_phys[p0-p00:p1-p00, nocc:, nocc:, nocc:]
     cput1 = log.timer('CCSD ao2mo load:               ', *cput1)
 
-    f.close() 
+    f.close()
     comm.Barrier()
     os.remove("gccsd_eri_tmp_%s.h5"%rank)
     mycc._eris = eris

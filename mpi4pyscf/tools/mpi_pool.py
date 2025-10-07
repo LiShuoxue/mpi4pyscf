@@ -109,7 +109,7 @@ class MPIPool(object):
             else:  # message are function args
                 if self.debug:
                     print("Function is neither close nor function wrapper.")
-                # print("Worker {0} got task {1}.".format(self.rank, task))
+                # print("Worker {0} got task {1}.".format(self.rank, [x.keys() if isinstance(x, dict) else x for x in task]))
                 self.worker_status = 'R'
                 # print("Function that calls =", self.function)
                 ans = self.function(*task)  # task = worker_args

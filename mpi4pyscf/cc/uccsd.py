@@ -20,6 +20,8 @@ from mpi4pyscf.cc import cc_tools as tools
 from mpi4pyscf.cc.cc_tools import SegArray
 
 
+BLKMIN = getattr(__config__, 'cc_ccsd_blkmin', 4)
+
 comm = mpi.comm
 rank = mpi.rank
 ntasks = mpi.pool.size
@@ -128,7 +130,8 @@ def get_integral_from_eris(key: str, eris, debug: bool = False) -> SegArray:
             seg_idx, seg_spin = key.index(k), 'xX'.index(k)
             break
     reduced = (seg_idx is None)
-    return SegArray(eris.get_integral(key), seg_idx, seg_spin, label=arr_label, debug=debug, reduced=reduced)
+    return SegArray(eris.get_integral(key), seg_idx, seg_spin,
+                    label=arr_label, debug=debug, reduced=reduced)
 
 
 def amplitudes_to_vector(t1, t2, out=None):
@@ -271,6 +274,7 @@ def make_tau_aa(t2_ooxv, t1a, r1a, vlocs, fac=1., out=None):
     return the segmented tau_aa at index 2.
     """
     vloc0, vloc1 = vlocs[rank]
+    # print(f"vlocs = {vlocs}")
     tau1aa = np.einsum("ix,jb->ijxb", t1a[:, vloc0:vloc1], r1a)
     tau1aa -= np.einsum("ix,jb->jixb", t1a[:, vloc0:vloc1], r1a)
     tau1aa = tools.segmented_transpose(tau1aa, 2, 3, 1., -1., vlocs=vlocs)
@@ -298,6 +302,7 @@ def make_tau(t2, t1, r1, vlocs=None, fac=1., out=None):
     else:
         vlocsa, vlocsb = vlocs
 
+    # print(f"rank = {rank} , shapes: t2_ooxv: {t2_ooxv.shape}, t2_oOxV: {t2_oOxV.shape}, t2_OOXV: {t2_OOXV.shape}")
     tau_ooxv = make_tau_aa(t2_ooxv, t1a, r1a, vlocs=vlocsa, fac=fac, out=out)
     tau_OOXV = make_tau_aa(t2_OOXV, t1b, r1b, vlocs=vlocsb, fac=fac, out=out)
     tau_oOxV = make_tau_ab(t2_oOxV, t1, r1, vlocsa=vlocsa, fac=fac, out=out)
@@ -305,45 +310,117 @@ def make_tau(t2, t1, r1, vlocs=None, fac=1., out=None):
     return tau_ooxv, tau_oOxV, tau_OOXV
 
 
-def _contract_vvvv_t2_symm(h, t):
-    """ijcd,acbd->ijab, t, h, but [ij] is one index."""
-    assert np.allclose(t, -t.transpose(1, 0, 2, 3))
-    _, nocc, nvir_seg, nvir = t.shape
-    tril_idx = np.tril_indices(nocc, -1)
-    
-    t_packed = t[tril_idx]  # Icd
-    t_packed = SegArray(t_packed, seg_idx=1, seg_spin=0, label='t')
-    h = SegArray(h, seg_idx=0, seg_spin=0, label='h')
-    # nocc_pair
-    res_packed = einsum_sz('Icd,acbd->Iab', t_packed, h,
-                nvira_or_vlocsa=nvir, nvirb_or_vlocsb=nvir).data # [c],[a]c->[a]
-    res = np.zeros((nocc, nocc, nvir_seg, nvir), dtype=t.dtype)
-    res[tril_idx] += res_packed
-    res = res - res.transpose(1, 0, 2, 3)
-    return res
+def _ctr_symm(t, h, out, nvir, einsum_func, sub_1, sub_2):
+    ndim_t_prev = t.ndim - 1
+    ndim_o_prev = out.ndim - 1
+    for i in range(nvir):
+        start, end = i * (i + 1) // 2, (i + 1) * (i + 2) // 2
+        # spl_idx = slice(start, end)
+        np.add.at(out, (slice(None), ) * ndim_o_prev + (i, ),
+                einsum_func(sub_1, t[(slice(None), ) * ndim_t_prev + (slice(i+1), )], h[:, :, slice(start, end)]))
+        if i > 0:
+            np.add.at(out, (slice(None), ) * ndim_o_prev + (slice(i), ),
+                einsum_func(sub_2, t[(slice(None), ) * ndim_t_prev + (i, )], h[:, :, slice(start, end - 1)]))
 
- 
-def _contract_vvvv_t2_slow(h, t):
-    # TODO: use the symmetry of the unparticipated [vv] indices.
-    _einsum = tools.segmented_einsum_new
+    return out
+
+
+def _contract_vvvv_slow(h, t, out=None, max_memory=2000):
     nvir_1, nvir_2 = h.shape[1], h.shape[2]
-    vlocss = (tools.get_vlocs(nvir_1), tools.get_vlocs(nvir_2))
-    res = _einsum('ijcd,acbd->ijab', arrs=(t, h), seg_idxs=(2, 0), vlocss=vlocss)
-    return res
+    return tools.segmented_einsum_new('ijcd,acdb->ijab', arrs=(t, h), seg_idxs=(2, 0),
+                                    vlocss=(tools.get_vlocs(nvir_1), tools.get_vlocs(nvir_2)), )
 
 
-def _add_vvvv(t1, t2, eris, vlocs=None):
+def _contract_s2vvvv_fast(xvvv, t2_OxV, out=None, max_memory=2000, same_spin=False):
+    """I<c>D, [a]<c>BD -> I[a]B, t2_oOxV, xvVV"""
+    # m: I (nocc_tot) n =: {B[a]} (nvira_seg * nvirb (ic)) k: {<c>D} (pc * nvirb (jc))
+    # a: mk; b: kn; c: mn
+    # FIXME[B01]: Wrong when segments are not the same length when _tmp is defined once,
+    # Currently avoid this error by duplicating slices and use 0 offset.
+
+    _dgemm = lib.numpy_helper._dgemm
+    assert t2_OxV.ndim == 3
+    nocc_tot, _, nvirb = t2_OxV.shape
+    nvira_seg, nvira, nvirb_pair = xvvv.shape
+    t2_OxV, xvvv = np.asarray(t2_OxV, order='C'), np.asarray(xvvv, order='C')
+    nvir_tot = nvira_seg * nvirb   # I, {[a]B}
+    Ht2_Oxv = np.zeros((nocc_tot, nvir_tot), order='C')
+
+    assert xvvv is not None
+    assert xvvv.ndim == 3
+    assert nvirb_pair == nvirb * (nvirb + 1) // 2
+
+    rotate_fn = partial(tools._rotate_vir_block, vlocs=tools.get_vlocs(nvira))
+    tril2sq = lib.square_mat_in_trilu_indices(nvirb)
+    unit = nvira*nvirb_pair*2 + nvirb**2*nvira/4 + 1
+    blksize = np.sqrt(max(BLKMIN**2, max_memory*.95e6/8/unit))
+    blksize = int(min((nvira+3)/4, blksize)) 
+
+    # I<c>D -> I {D<c>}
+    for task_id, t2_OxV, p0, p1 in rotate_fn(t2_OxV):
+        pc = p1 - p0    # index <c>
+        # _tmp = t2_OxV.transpose(0, 2, 1).reshape(nocc_tot, pc * nvirb) FIXME[B01]
+        for j0, j1 in lib.prange(0, nvirb, blksize):
+            jc = j1 - j0 # index D
+            _tmp = t2_OxV[:, :, j0:j1].transpose(0, 2, 1).reshape(nocc_tot, pc * jc)
+            for i0, i1 in lib.prange(0, nvirb, blksize):
+                ic = i1 - i0 # index B
+                # [a]<c>BD -> {D<c>} {B[a]}
+                _xvvv = np.zeros((pc * jc, nvira_seg * ic), order='C')
+                _xvvv += xvvv[:, p0:p1, tril2sq[i0:i1, j0:j1]].transpose((3, 1, 2, 0)).reshape((pc * jc, nvira_seg * ic))
+                _dgemm(trans_a='N', trans_b='N',
+                       m=nocc_tot, n=nvira_seg * ic, k=pc * jc,
+                       a=_tmp, b=_xvvv, c=Ht2_Oxv, alpha=1., beta=1.,
+                       offseta=0,
+                       # offseta=j0 * nvira_seg FIXME[B01]
+                       offsetb=0, offsetc=i0 * nvira_seg # * nocc_tot
+                       )
+        _tmp = None
+
+    return Ht2_Oxv.reshape((nocc_tot, nvirb, nvira_seg)).transpose(0, 2, 1)
+
+
+def _add_vvvv(t1, t2, eris, vlocs=None, max_memory=2000):
+
+    def _expand_Ovv(t2_tril):
+        assert t2_tril.ndim == 3
+        nocc_pair, nvira, nvirb = t2_tril.shape
+        nocc = int(np.sqrt(2 * nocc_pair)) + 1
+        assert nocc * (nocc - 1) // 2 == nocc_pair
+        t2_full = np.zeros((nocc, nocc, nvira, nvirb), dtype=t2_tril.dtype)
+        idxa, idya = np.tril_indices(nocc, -1)
+        t2_full[idxa, idya, :, :] = t2_tril
+        t2_full[idya, idxa, :, :] = -t2_tril
+        t2_tril = None
+        return t2_full
+
     if t1 is None:
         t2_ooxv, t2_oOxV, t2_OOXV = t2
     else:
         t2_ooxv, t2_oOxV, t2_OOXV = make_tau(t2, t1, t1, vlocs=vlocs)
-    u2_ooxv = _contract_vvvv_t2_symm(eris.get_integral("xvvv"), t2_ooxv)
-    u2_OOXV = _contract_vvvv_t2_symm(eris.get_integral("XVVV"), t2_OOXV)
-    u2_oOxV = _contract_vvvv_t2_slow(eris.get_integral("xvVV"), t2_oOxV)
+
+    nocca, noccb, nvira_seg, nvirb = t2_oOxV.shape
+
+    t2_ooxv_tril = t2_ooxv[np.tril_indices(nocca, -1)]
+    t2_OOXV_tril = t2_OOXV[np.tril_indices(noccb, -1)]
+    t2_oOxV_tril = t2_oOxV.reshape(nocca * noccb, nvira_seg, nvirb)
+
+    u2_ooxv = _contract_s2vvvv_fast(eris.xvvv, t2_ooxv_tril, max_memory=max_memory)
+    u2_OOXV = _contract_s2vvvv_fast(eris.XVVV, t2_OOXV_tril, max_memory=max_memory)
+    u2_oOxV = _contract_s2vvvv_fast(eris.xvVV, t2_oOxV_tril, max_memory=max_memory)
+
+    u2_oOxV = u2_oOxV.reshape(nocca, noccb, nvira_seg, nvirb)
+    u2_ooxv = _expand_Ovv(u2_ooxv)
+    u2_OOXV = _expand_Ovv(u2_OOXV)
+
+    # u2_ooxv = _contract_vvvv_slow(get_integral_from_eris('xvvv', eris=eris).data, t2_ooxv)
+    # u2_OOXV = _contract_vvvv_slow(get_integral_from_eris('XVVV', eris=eris).data, t2_OOXV)
+    # u2_oOxV = _contract_vvvv_slow(get_integral_from_eris('xvVV', eris=eris).data, t2_oOxV)
+
     return u2_ooxv, u2_oOxV, u2_OOXV
 
 
-class _ChemistsERIs:
+class _ChemistsERIs(pyscf_uccsd._ChemistsERIs):
     _eri_keys = ('oooo', 'oxoo', 'oxov', 'ooxv', 'ovxo', 'oxvv', 'xvvv',
                  'OOOO', 'OXOO', 'OXOV', 'OOXV', 'OVXO', 'OXVV', 'XVVV',
                  'ooOO', 'oxOO', 'oxOV', 'ooXV', 'oxVO', 'oxVV', 'xvVV',
@@ -402,7 +479,13 @@ class _ChemistsERIs:
         # for the segment with ?xvv, unpack the triled indices of the last two indices.
         assert res.ndim == 3
         n1, n2, nvir_pair = res.shape
-        r = lib.unpack_tril(res.reshape(n1 * n2, nvir_pair))
+        nvir = int(np.sqrt(nvir_pair * 2))
+        r = np.zeros((n1, n2, nvir, nvir))
+        tril_idx = np.tril_indices(nvir)
+        r[:, :, tril_idx[0], tril_idx[1]] = res
+        r = r + r.transpose(0, 1, 3, 2)
+        r[:, :, np.arange(nvir), np.arange(nvir)] /= 2.
+        # r = lib.unpack_tril(res.reshape(n1 * n2, nvir_pair))
         nvir = r.shape[2]
         return r.reshape(n1, n2, nvir, nvir)
 
@@ -450,20 +533,29 @@ def _make_eriaa_incore(eri: ArrayLike, eris: _ChemistsERIs, nocc: int,
     cput = cput0
     for eri_tag, eri_seg_tag, seg_idx in zip(eri_tags, eri_seg_tags, slice_idx):
         def _fn():
+
+            # temporarily disable the compressed saving
+            # return take_eri(eri, *map(occ_range_dict.get, eri_tag), compact=False)
+
             idx_ov = tril_take_idx(occ_range_dict['o'], occ_range_dict['v'], compact=False)
             idx_vv_nt = tril_take_idx(occ_range_dict['v'], occ_range_dict['v'], compact=False)
             idx_vv = tril_take_idx(occ_range_dict['v'], occ_range_dict['v'], compact=True)
             if eri_tag == "ovvv":
                 res = eri[np.ix_(idx_ov, idx_vv)].reshape(nocc, nvir, nvir*(nvir+1)//2)
             elif eri_tag == "vvvv":
+                # res = eri[np.ix_(idx_vv, idx_vv)].reshape(nvir*(nvir+1)//2, nvir*(nvir+1)//2)
                 res = eri[np.ix_(idx_vv_nt, idx_vv)].reshape(nvir, nvir, nvir*(nvir+1)//2)
             else:
-                res = take_eri(eri, *map(occ_range_dict.get, eri_tag), compact=(eri_tag == 'vvvv'))
+                res = take_eri(eri, *map(occ_range_dict.get, eri_tag), compact=False)
             return res
 
         if rank == 0 and log.verbose >= logger.DEBUG:
             print(f"Seg_idx = {seg_idx} for eri_tag = {eri_tag}")
+
+        # if eri_tag != 'vvvv':
         eri_mo_seg = tools.get_mpi_array(_fn, vlocs=vlocs, seg_idx=seg_idx)
+        # else:
+            # eri_mo_seg = _fn() if rank == 0 else None
         setattr(eris, eri_seg_tag, eri_mo_seg)
         cput = log.timer("UICCSD scatter {}:              ".format(eri_seg_tag), *cput)
     return cput
@@ -479,8 +571,9 @@ def _make_eriab_incore(eri_ab: ArrayLike, eris: _ChemistsERIs,
     occ_range_dict = dict(o=np.arange(0, nocca), v=np.arange(nocca, nmoa),
                           O=np.arange(0, noccb), V=np.arange(noccb, nmob))
 
-    eri_tags = ('ooOO', 'ovOO', 'ovOV', 'ooVV', 'ovVO', 'ovVV', 'vvVV',
-                'OVoo', 'OOvv', 'OVvo', 'OVvv')
+    eri_tags = ('ooOO',
+                'ovOO', 'ovOV', 'ooVV', 'ovVO', 'ovVV',
+                'vvVV', 'OVoo', 'OOvv', 'OVvo', 'OVvv')
     eri_seg_tags = ('ooOO',
                     'oxOO', 'oxOV', 'ooXV', 'oxVO', 'oxVV',
                     'xvVV', 'OXoo', 'OOxv', 'OVxo', 'OXvv')
@@ -490,12 +583,19 @@ def _make_eriab_incore(eri_ab: ArrayLike, eris: _ChemistsERIs,
 
     for eri_tag, eri_seg_tag, seg_idx in zip(eri_tags, eri_seg_tags, slice_idx):
         def _fn():
+            eri_ba = eri_ab.T
+
+            # temporarily disable the compressed saving
+            # if eri_tag in ('OVvv', 'OVoo', 'OOvv', 'OVvo'):
+                # return take_eri(eri_ba, *map(occ_range_dict.get, eri_tag), compact=False)
+            # else:
+                # return take_eri(eri_ab, *map(occ_range_dict.get, eri_tag), compact=False)
+
             idx_ov = tril_take_idx(occ_range_dict['o'], occ_range_dict['v'], compact=False)
             idx_OV = tril_take_idx(occ_range_dict['O'], occ_range_dict['V'], compact=False)
             idx_vv_nt = tril_take_idx(occ_range_dict['v'], occ_range_dict['v'], compact=False)
             idx_vv = tril_take_idx(occ_range_dict['v'], occ_range_dict['v'], compact=True)
             idx_VV = tril_take_idx(occ_range_dict['V'], occ_range_dict['V'], compact=True)
-            eri_ba = eri_ab.T
             if eri_tag == 'ovVV':
                 return eri_ab[np.ix_(idx_ov, idx_VV)].reshape(nocca, nvira, nvirb*(nvirb+1)//2)
             elif eri_tag == "OVvv":
@@ -505,12 +605,15 @@ def _make_eriab_incore(eri_ab: ArrayLike, eris: _ChemistsERIs,
             elif eri_tag in ('OVoo', 'OOvv', 'OVvo'):
                 return take_eri(eri_ba, *map(occ_range_dict.get, eri_tag), compact=False)
             else:
-                return take_eri(eri_ab, *map(occ_range_dict.get, eri_tag), compact=(eri_tag == 'vvVV'))
+                return take_eri(eri_ab, *map(occ_range_dict.get, eri_tag), compact=False)
 
         if rank == 0 and log.verbose >= logger.DEBUG:
             print(f"Seg_idx = {seg_idx} for eri_tag = {eri_tag}")
 
+        # if eri_tag != "vvVV":
         eri_mo_seg = tools.get_mpi_array(_fn, vlocs=[vlocs_a, vlocs_b]['X' in eri_seg_tag], seg_idx=seg_idx)
+        # else:
+            # eri_mo_seg = _fn() if rank == 0 else None
         setattr(eris, eri_seg_tag, eri_mo_seg)
         cput = log.timer("UICCSD scatter {}:              ".format(eri_seg_tag), *cput)
     return cput
@@ -620,8 +723,24 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
     u1b_0 = np.zeros_like(t1b)
 
     taus = make_tau(t2, t1, t1, (vlocs_a, vlocs_b))
+
+    u2_ooxv, u2_oOxV, u2_OOXV = _add_vvvv(t1=None, t2=taus, eris=eris, vlocs=vlocs_ab, max_memory=cc.max_memory)
     tau_ooxv, tau_oOxV, tau_OOXV = taus
-    u2_ooxv, u2_oOxV, u2_OOXV = _add_vvvv(t1=None, t2=taus, eris=eris, vlocs=vlocs_ab)
+
+    """
+    tau_aa = tools.collect_array(tau_ooxv, seg_idx=2, bcast=False)
+    tau_bb = tools.collect_array(tau_OOXV, seg_idx=2, bcast=False)
+    tau_ab = tools.collect_array(tau_oOxV, seg_idx=2, bcast=False)
+    # print(f"tau_aa.shape = {tau_aa.shape}, tau_ab.shape = {tau_ab.shape}, tau_bb.shape = {tau_bb.shape}")
+    if rank == 0:
+        u2_aa, u2_ab, u2_bb = cc._add_vvvv(None, (tau_aa, tau_ab, tau_bb), eris)
+    tau_aa = tau_bb = tau_ab = None
+    u2_ooxv = tools.get_mpi_array(lambda: u2_aa, vlocs=vlocs_a, seg_idx=2)
+    u2_OOXV = tools.get_mpi_array(lambda: u2_bb, vlocs=vlocs_b, seg_idx=2)
+    u2_oOxV = tools.get_mpi_array(lambda: u2_ab, vlocs=vlocs_a, seg_idx=2)
+    u2_aa = u2_bb = u2_ab = None
+    """
+
     u2_ooxv *= .5
     u2_OOXV *= .5
 
@@ -662,10 +781,10 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
         oxvv = _fntp(oxvv, 1, 3, 1.0, -1.0)
         Fvva += _einsum('mf,mfae->ae', t1_ox, oxvv) # [f],[f]->...
         wovxo += _einsum('jf,mebf->mbej', t1a, oxvv)    # ...,[e]->[e]
-        u1a += .5 * _einsum('mief,meaf->ia', t2_ooxv, oxvv)
-        u2_ooxv += _einsum('ie,mbea->imab', t1a, oxvv.conj())
+        u1a += .5 * _einsum('mief,meaf->ia', t2_ooxv, oxvv) # [e],[e]->...
+        u2_ooxv += _einsum('ie,mbea->imab', t1a, oxvv.conj())   # ...,[b]->[b]-->[a]
         tmp1aa = _einsum('ijef,mebf->ijmb', tau_ooxv, oxvv).collect().set(label='tmp1aa', debug=debug)    # [e],[e]->...
-        u2_ooxv -= _einsum('ijmb,ma->ijab', tmp1aa, t1_ox*.5)
+        u2_ooxv -= _einsum('ijmb,ma->ijab', tmp1aa, t1_ox*.5)   # ...,[a]->[a]
         oxvv = tmp1aa = None
 
     if nvirb > 0 and noccb > 0:
@@ -674,37 +793,35 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
         Fvvb += _einsum('mf,mfae->ae', t1_OX, OXVV)
         wOVXO += _einsum('jf,mebf->mbej', t1b, OXVV)
         u1b += 0.5 * _einsum('MIEF,MEAF->IA', t2_OOXV, OXVV)
-        u2_OOXV += _einsum('ie,mbea->imab', t1b, OXVV.conj())
-        tmp1bb = SegArray(np.zeros((noccb, noccb, noccb, nvirb), dtype=dtype), label='tmp1bb', debug=debug)
-        tmp1bb += _einsum('ijef,mebf->ijmb', tau_OOXV, OXVV)
+        u2_OOXV += _einsum('ie,mbea->imab', t1b, OXVV.conj())   # ...,[b]->[b]-->[a]
+        tmp1bb = _einsum('ijef,mebf->ijmb', tau_OOXV, OXVV).set(label='tmp1bb', debug=debug)    # [e],[e]->...
         tmp1bb = tmp1bb.collect()
-        u2_OOXV -= _einsum('ijmb,ma->ijab', tmp1bb, t1_OX * .5)
+        u2_OOXV -= _einsum('ijmb,ma->ijab', tmp1bb, t1_OX * .5) # ...,[a]->[a]
         OXVV = tmp1bb = None
 
     if nvirb > 0 and nocca > 0:
         oxVV = _get_integral('oxVV')
-        Fvvb += _einsum('mf,mfAE->AE', t1_ox, oxVV)
-        woVxO += _einsum('JF,meBF->mBeJ', t1b, oxVV)
-        woVXo += _einsum('jf,mfBE->mBEj',-t1_ox, oxVV)
-        u1b += _einsum('mIeF,meAF->IA', t2_oOxV, oxVV)
-        u2_oOxV += _einsum('IE,maEB->mIaB', t1b, oxVV.conj())
-        tmp1ab = SegArray(np.zeros((nocca, noccb, nocca, nvirb), dtype=dtype), label='tmp1ab', debug=debug)
-        tmp1ab += _einsum('iJeF,meBF->iJmB', tau_oOxV, oxVV)
+        Fvvb += _einsum('mf,mfAE->AE', t1_ox, oxVV) # [f],[f]->...
+        woVxO += _einsum('JF,meBF->mBeJ', t1b, oxVV)    # ...,[e]->[e]
+        woVXo += _einsum('jf,mfBE->mBEj',-t1_ox, oxVV)  # [f],[f]->...
+        u1b += _einsum('mIeF,meAF->IA', t2_oOxV, oxVV)  # [e],[e]->...
+        u2_oOxV += _einsum('IE,maEB->mIaB', t1b, oxVV.conj()) # ...,[b]->[b]
+        tmp1ab = _einsum('iJeF,meBF->iJmB', tau_oOxV, oxVV).set(label='tmp1ab', debug=debug)  # [e],[e]->...
         tmp1ab = tmp1ab.collect()
-        u2_oOxV -= _einsum('iJmB,ma->iJaB', tmp1ab, t1_ox)
+        u2_oOxV -= _einsum('iJmB,ma->iJaB', tmp1ab, t1_ox)  # ...,[a]->[a]
         oxVV = tmp1ab = None
 
     if nvira > 0 and noccb > 0:
         OXvv = _get_integral('OXvv')
-        Fvva += _einsum('MF,MFae->ae', t1_OX, OXvv)
-        wOvXo += _einsum('jf,MEaf->MaEj', t1a, OXvv)
-        wOvxO += _einsum('JF,MFbe->MbeJ', -t1_OX, OXvv)
+        Fvva += _einsum('MF,MFae->ae', t1_OX, OXvv)     # [F],[F]->...
+        wOvXo += _einsum('jf,MEaf->MaEj', t1a, OXvv)    # ...,[E]->[E]
+        wOvxO += _einsum('JF,MFbe->MbeJ', -t1_OX, OXvv) # [F],[F]e->e
         u1a += _einsum('iMfE,MEaf->ia', t2_oOxV, OXvv)
-        u2_oOxV += _einsum('ie,MBea->iMaB', t1a, OXvv.conj())
+        u2_oOxV += _einsum('ie,MBea->iMaB', t1a, OXvv.conj())   # ...,[B]->[B]-->[a]
         tmp1ba = SegArray(np.zeros((noccb, nocca, nvirb, nocca), dtype=dtype), label='tmp1ba', debug=debug)
-        tmp1ba += _einsum('iJeF,MFbe->iJbM', tau_oOxV, OXvv)
+        tmp1ba += _einsum('iJeF,MFbe->iJbM', tau_oOxV, OXvv) # [e]F,[F]e->...
         tmp1ba = tmp1ba.collect()
-        u2_oOxV -= _einsum('iJbM,MA->iJbA', tmp1ba[:, :, slc_va, :], t1b)
+        u2_oOxV -= _einsum('iJbM,MA->iJbA', tmp1ba[:, :, slc_va, :], t1b)   # [b],...->[b]
         OXvv = tmp1ba = None
 
     if checkpoint == 10:
@@ -1065,7 +1182,9 @@ def energy(cc, t1=None, t2=None, eris=None):
 
 
 @mpi.parallel_call(skip_args=[1, 2], skip_kwargs=['t1', 't2'])
-def distribute_amplitudes_(mycc, t1, t2):
+def distribute_amplitudes_(mycc, t1=None, t2=None):
+    print(f"rank = {rank}, type(t1) = {type(t1)}, type(t2) = {type(t2)}")
+
     _sync_(mycc)
     nvira = mycc.nmo[0] - mycc.nocc[0]
     nvirb = mycc.nmo[1] - mycc.nocc[1]
@@ -1073,9 +1192,12 @@ def distribute_amplitudes_(mycc, t1, t2):
     vlocs_b = tools.get_vlocs(nvirb)
 
     def _ft1a():
-        if rank == 0: return t1[0] if t1 is not None else mycc.t1[0]
+        if rank == 0:
+            # print(f"type{type(t1)}")
+            return t1[0] if t1 is not None else mycc.t1[0]
     def _ft1b():
-        if rank == 0: return t1[1] if t1 is not None else mycc.t1[1]
+        if rank == 0:
+            return t1[1] if t1 is not None else mycc.t1[1]
     def _ft2aa():
         if rank == 0: return t2[0] if t2 is not None else mycc.t2[0]
     def _ft2ab():
@@ -1240,18 +1362,52 @@ class UCCSD(pyscf_uccsd.UCCSD):
             self.check_sanity()
         self.dump_flags()
 
+        self.e_hf = self.get_e_hf()
+
         self.converged, self.e_corr, self.t1, self.t2 = \
             mpi_rccsd.kernel(self, eris, t1, t2, max_cycle=self.max_cycle,
                              tol=self.conv_tol, tolnormt=self.conv_tol_normt,
                              verbose=self.verbose)
+
         if rank == 0:
             self._finalize()
         return self.e_corr, self.t1, self.t2
+
+    def solve_lambda(self, t1=None, t2=None, l1=None, l2=None, eris=None, approx_l=False):
+        from mpi4pyscf.cc import uccsd_lambda
+        self.converged_lambda, self.l1, self.l2 = uccsd_lambda.kernel(
+            self, eris, t1, t2, l1, l2,
+            max_cycle=self.max_cycle,
+            tol=self.conv_tol_normt,
+            verbose=self.verbose
+        )
+        return self.l1, self.l2
+
+    def make_rdm1(self, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
+                  with_frozen=True, with_mf=True):
+        '''Un-relaxed 1-particle density matrix in MO space
+
+        Returns:
+            dm1a, dm1b
+        '''
+        from mpi4pyscf.cc import uccsd_rdm
+        return uccsd_rdm.make_rdm1(self, t1, t2, l1, l2, ao_repr=ao_repr,
+                                   with_frozen=with_frozen, with_mf=with_mf)
+
+    def make_rdm2(self, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
+                  with_frozen=True, with_dm1=True):
+        '''2-particle density matrix in spin-orbital basis.
+        '''
+        from mpi4pyscf.cc import uccsd_rdm
+        return uccsd_rdm.make_rdm2(self, t1, t2, l1, l2, ao_repr=ao_repr,
+                                   with_frozen=with_frozen, with_dm1=with_dm1)
 
     def _finalize(self):
         """
         Hook for dumping results and clearing up the object.
         """
+        pyscf_uccsd.UCCSD._finalize(self)
+        # self._release_regs()
         return self
 
     def kernel(self, t1=None, t2=None, eris=None):
