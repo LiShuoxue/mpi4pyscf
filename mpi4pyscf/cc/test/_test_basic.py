@@ -38,7 +38,7 @@ def _get_segmented_array(fname: str, key: str, vlocs: list, seg_idx: int, debug:
         arr, arr_segs = None, None
 
     # NOTE: Should use the default setting of 'data' arg to avoid unexpected reshape.
-    arr_seg = mpi.scatter_new(arr_segs, root=0)
+    arr_seg = mpi.scatter(arr_segs, root=0)
     arr, arr_segs = None, None
     return arr_seg
 
@@ -51,6 +51,25 @@ def _get_broadcast_array(fname: str, key: str) -> ArrayLike:
         arr = None
     arr = mpi.bcast(arr, root=0)
     return arr
+
+
+def _get_segmented_array_new(fname: str, key: str, vlocs: list, seg_idx: int, debug: bool = False) -> ArrayLike:
+    from mpi4pyscf.cc.cc_tools import scatter_seg
+    if rank == 0:
+        arr = _get_array(fname, key)
+        segs = [(slice(None), ) * seg_idx + (slice(*x), ) for x in vlocs]
+
+        if debug:
+            for i, seg in enumerate(segs):
+                print(f"in __get_segmented_array: slices for rank {i} = {tools._tuple_of_slices_to_str(seg)}")
+        arr_segs = [arr[seg] for seg in segs]
+
+    else:
+        arr, arr_segs = None, None
+
+    arr_seg = scatter_seg(arr_segs, root=0, seg_idx=seg_idx)
+    arr, arr_segs = None, None
+    return arr_seg
 
 
 def _debug_segmented_arr_info(arr: ArrayLike, arr_name: str, vlocs: list,
@@ -69,6 +88,20 @@ def _debug_segmented_arr_info(arr: ArrayLike, arr_name: str, vlocs: list,
         f"    First few elements of arr{slc_str}: {_arr.ravel()[:5]}\n"
     )
     print(msg)
+
+
+@mpi.parallel_call
+def test_scatter_seg(dev, fname: str):
+    dim_D = 25
+    vlocs_D = tools.get_vlocs(dim_D)
+    t = _get_segmented_array_new(fname, 't_ABDC', vlocs=vlocs_D, seg_idx=2, debug=False)
+    t_ref = _get_segmented_array(fname, 't_ABDC', vlocs=vlocs_D, seg_idx=2, debug=False)
+    print(f"rank = {rank}, t.shape = {t.shape}, t_ref.shape = {t_ref.shape}")
+    err_abs = np.linalg.norm(t - t_ref)
+    norm_ref = np.linalg.norm(t_ref)
+    err_rel = err_abs / norm_ref
+    print(f"test_scatter_seg: rank = {rank} , err_rel = {err_abs} / {norm_ref} = {err_rel}")
+    assert err_rel < 1e-12
 
 
 @mpi.parallel_call

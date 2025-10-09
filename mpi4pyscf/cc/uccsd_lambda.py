@@ -428,6 +428,21 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
     t2_ooxv, t2_oOxV, t2_OOXV = t2  # aa, ab, bb
     l1a, l1b = l1
     l2_ooxv, l2_oOxV, l2_OOXV = l2
+
+
+    if isinstance(t2_ooxv, SegArray):
+        t2_ooxv, t2_oOxV, t2_OOXV = t2_ooxv.data, t2_oOxV.data, t2_OOXV.data
+    if isinstance(l2_ooxv, SegArray):
+        l2_ooxv, l2_oOxV, l2_OOXV = l2_ooxv.data, l2_oOxV.data, l2_OOXV.data
+    if isinstance(t1a, SegArray):
+        t1a, t1b = t1a.data, t1b.data
+    if isinstance(l1a, SegArray):
+        l1a, l1b = l1a.data, l1b.data
+
+    t2 = (t2_ooxv, t2_oOxV, t2_OOXV)
+    l2 = (l2_ooxv, l2_oOxV, l2_OOXV)
+    t1, l1 = (t1a, t1b), (l1a, l1b)
+
     (nocca, nvira), (noccb, nvirb) = t1a.shape, t1b.shape
     nvira_seg, nvirb_seg = t2_ooxv.shape[2], t2_OOXV.shape[2]
     vlocs_a, vlocs_b = map(tools.get_vlocs, (nvira, nvirb))
@@ -446,6 +461,8 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
     u2_oOxV = np.zeros((nocca, noccb, nvira_seg, nvirb), dtype=dtype)
     u2_OOXV = np.zeros((noccb, noccb, nvirb_seg, nvirb), dtype=dtype)
     tau_ooxv, tau_oOxV, tau_OOXV = mpi_uccsd.make_tau(t2, t1, t1)
+
+    # print(f"l2_ooxv.type = {type(l2_ooxv)} l2_oOxV.type = {type(l2_oOxV)} l2_OOXV.type = {type(l2_OOXV)}")
     m3aa, m3ab, m3bb = mpi_uccsd._add_vvvv(t1=None, t2=(l2_ooxv.conj(),l2_oOxV.conj(),l2_OOXV.conj()), eris=eris, vlocs=vlocs_ab)
     m3aa = m3aa.conj()
     m3ab = m3ab.conj()

@@ -12,7 +12,7 @@ ntasks = mpi.pool.size
 
 def generate_test_data():
     fname = "./data/random_tensor.h5"
-    dim1, dim2, dim3 = 20, 24, 28
+    dim1, dim2, dim3, dim4 = 20, 24, 28, 25
     with h5py.File(fname, 'w') as ftmp:
         ftmp.create_dataset('t_AB', data=np.random.random(size=(dim1, dim2)))
         ftmp.create_dataset('t_BC', data=np.random.random(size=(dim2, dim3)))
@@ -20,6 +20,7 @@ def generate_test_data():
         ftmp.create_dataset('t_ABB', data=np.random.random(size=(dim1, dim2, dim2)))
         ftmp.create_dataset('t_ABBB', data=np.random.random(size=(dim1, dim2, dim2, dim2)))
         ftmp.create_dataset('t_ACBB', data=np.random.random(size=(dim1, dim3, dim2, dim2)))
+        ftmp.create_dataset('t_ABDC', data=np.random.random(size=(dim1, dim2, dim4, dim3)))
 
 
 def test_segd_einsum_type():
@@ -95,12 +96,15 @@ def test_dgemm():
     print("max diff of dgemm = ", np.abs(c - ref).max() / np.abs(ref).max())
 
 
-# def test_dgemm_#
-
+def test_scatter_seg():
+    fname = './data/random_tensor.h5'
+    testfuncs.test_scatter_seg(None, fname)
 
 
 if __name__ == "__main__":
-    test_dgemm()
+    # test_dgemm()
+    # generate_test_data()
+    test_scatter_seg()
     # if rank == 0:
         # test_segd_einsum_type()
         # test_segarr_cls()

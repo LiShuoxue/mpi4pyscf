@@ -4,6 +4,7 @@ backend: parallel_call functions for testing UCCSD class
 import numpy as np
 from mpi4pyscf.cc import uccsd as uccsd_mpi
 from mpi4pyscf.cc import uccsd_lambda as uccsd_lambda_mpi
+from mpi4pyscf.cc import uccsd_rdm as uccsd_rdm_mpi
 from mpi4pyscf.tools import mpi
 from mpi4pyscf.cc.uccsd import UCCSD as UCCSD_MPI
 from mpi4pyscf.cc import cc_tools
@@ -985,17 +986,10 @@ def test_make_tau(cc: UCCSD_MPI, t1=None, t2=None):
 
 @mpi.parallel_call
 def test_add_vvvv(cc: UCCSD_MPI):
-
-    # pr = cProfile.Profile()
-    # pr.enable()
-
     if getattr(cc, '_eris', None) is None:
         cc.ao2mo(cc.mo_coeff)
     _, t1, t2 = cc.init_amps()
     oovvs = uccsd_mpi._add_vvvv(t1=t1, t2=t2, eris=cc._eris)
-
-    # pr.disable()
-    # pr.dump_stats(f'uccsd_mpi_add_vvvv_rank{rank}.prof')
     keys = ('oovv_aa', 'oovv_ab', 'oovv_bb')
     res = {k: cc_tools.collect_array(oovvs[i], seg_idx=2) for i, k in enumerate(keys)}
     return res
@@ -1079,9 +1073,11 @@ def test_update_lambda(cc: UCCSD_MPI):
     t1, t2 = cc.update_amps(t1, t2, cc._eris)
     l1, l2 = t10, t20
     imds = uccsd_lambda_mpi.make_intermediates(cc, t1, t2, cc._eris)
-    l1new, l2new = uccsd_lambda_mpi.update_lambda(
-        cc, t1, t2, l1, l2, cc._eris, imds, checkpoint=None, return_segarray=return_segarray)
-    (l1a, l1b), (l2aa, l2ab, l2bb) = l1new, l2new
+    for _ in range(3):
+        l1, l2 = uccsd_lambda_mpi.update_lambda(
+            cc, t1, t2, l1, l2, cc._eris, imds, checkpoint=None,
+            return_segarray=return_segarray)
+    (l1a, l1b), (l2aa, l2ab, l2bb) = l1, l2
     if return_segarray:
         res = dict(l1a=l1a.data, l1b=l1b.data,
                 l2aa=l2aa.collect().data,
@@ -1095,5 +1091,32 @@ def test_update_lambda(cc: UCCSD_MPI):
 
 
 @mpi.parallel_call
-def test_rdm_single_shot():
-    """"""
+def test_rdm_single_shot(cc: UCCSD_MPI):
+    UPDATE_STEP = 3
+    if getattr(cc, '_eris', None) is None:
+        cc.ao2mo(cc.mo_coeff)
+    _, t1, t2 = cc.init_amps()
+    for _ in range(UPDATE_STEP):
+        t1, t2 = cc.update_amps(t1, t2, eris=cc._eris)
+    l1, l2 = t1, t2
+    imds = uccsd_lambda_mpi.make_intermediates(cc, t1, t2, cc._eris)
+    for _ in range(UPDATE_STEP):
+        l1, l2 = uccsd_lambda_mpi.update_lambda(cc, t1, t2, l1, l2, cc._eris, imds)
+
+    rdm1 = uccsd_rdm_mpi.make_rdm1(cc, t1, t2, l1, l2, ao_repr=True)
+    rdm2 = uccsd_rdm_mpi.make_rdm2(cc, t1, t2, l1, l2, ao_repr=True)
+
+    res = dict(
+        t1a=t1[0], t1b=t1[1],
+        t2aa=t2[0], t2ab=t2[1], t2bb=t2[2],
+        l1a=l1[0], l1b=l1[1],
+        l2aa=l2[0], l2ab=l2[1], l2bb=l2[2])
+
+    for k in ('t2aa', 't2ab', 't2bb', 'l2aa', 'l2ab', 'l2bb',):
+        res[k] = cc_tools.collect_array(res[k], seg_idx=2)
+
+    if rank == 0:
+        res.update(rdm1a=rdm1[0], rdm1b=rdm1[1],
+                   rdm2aa=rdm2[0], rdm2ab=rdm2[1], rdm2bb=rdm2[2])
+
+    return res

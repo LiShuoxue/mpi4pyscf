@@ -1,5 +1,5 @@
 """
-Common MPI tools (einsum, transpose) for coupled-cluster methods.
+Common MPI tools (einsum, transpose etc.) for coupled-cluster methods.
 
 Author: Shuoxue Li <sli7@caltech.edu>
 """
@@ -15,6 +15,65 @@ from mpi4pyscf.cc.ccsd import (_task_location, _rotate_vir_block, _cp)
 comm = mpi.comm
 rank = mpi.rank
 ntasks = mpi.pool.size
+
+
+def scatter_seg(sendbuf: list[ArrayLike], root=0, seg_idx=0):
+    """
+    scatter that avoids the dipls overflow with a certain segmentation index.
+    Adapted from mpi.scatter_new
+    """
+    from mpi4py import MPI
+
+    if rank == root:
+        dtype = sendbuf[0].dtype
+        shape = [x.shape for x in sendbuf]
+        ndim = len(shape[0])
+        assert isinstance(seg_idx, int) and 0 <= seg_idx < ndim
+        match_idx = np.delete(np.arange(ndim), seg_idx)
+        matched = all([np.allclose(np.array(x)[match_idx], np.array(shape[0])[match_idx]) for x in shape[1:]])
+        shape = comm.scatter(shape)
+        counts = np.asarray([x.size for x in sendbuf])
+        tp = (seg_idx, ) + tuple(range(seg_idx)) + tuple(range(seg_idx+1, ndim))
+        tp_inv = tuple(np.argsort(tp))
+        # broadcast all the important info
+        comm.bcast((dtype, counts, matched, match_idx, tp, tp_inv))
+
+        # NOTE put the segmented index in the front
+        sendbuf = [np.asarray(x.transpose(tp), dtype, order='C').ravel() for x in sendbuf]
+        sendbuf = np.hstack(sendbuf)
+    else:
+        shape = comm.scatter(None)
+        dtype, counts, matched, match_idx, tp, tp_inv = comm.bcast(None)
+
+    # NOTE `shape` are scattered to each processes.
+
+    if matched:
+        # NOTE `each_count` is the size of unsegmented dimensions
+        each_count = int(np.prod(np.array(shape)[match_idx]))
+        if each_count > 1:
+            counts = counts // each_count
+            elem_dtype = MPI._typedict.get(dtype.char)
+            mpi_dtype = MPI.Datatype(elem_dtype).Create_contiguous(each_count).Commit()
+        else:
+            each_count = 1
+            mpi_dtype = dtype
+    else:
+        raise ValueError("The unsegmented dimensions of the arrays should be the same.")
+
+    # Currently `counts` becomes the dimensions of the segmented indices rather than the total size.
+    displs = np.append(0, np.cumsum(counts[:-1]))
+    recvbuf = np.empty(np.prod(shape), dtype=dtype)
+
+    # BLKSIZE uses the info of maximum integer, which avoids the dipls overflow.
+    for p0, p1 in mpi.prange(0, np.max(counts), mpi.BLKSIZE):
+        counts_seg = mpi._segment_counts(counts, p0, p1)
+        comm.Scatterv([sendbuf, counts_seg, displs+p0, mpi_dtype],
+                      [recvbuf[p0*each_count:p1*each_count], mpi_dtype], root)
+
+    if matched and each_count > 1:
+        mpi_dtype.Free()
+
+    return recvbuf.reshape(tuple(np.array(shape)[np.array(tp)])).transpose(tp_inv)
 
 
 class SegEinsumType(IntFlag):
@@ -71,8 +130,7 @@ def get_mpi_array(arr_fn: callable, vlocs: list | None = None, seg_idx: int | No
             # print(f"In get_mpi_array: {[x.shape for x in arr_segs]}")
     else:
         arr, arr_segs = None, None
-    arr_seg = mpi.scatter(arr_segs, root=0)
-    # arr_seg = mpi.scatter_new(arr_segs, root=0)
+    arr_seg = scatter_seg(sendbuf=arr_segs, root=0, seg_idx=seg_idx)
     arr, arr_segs = None, None
     return arr_seg
 
@@ -233,10 +291,10 @@ def __get_segmented_einsum_type(subscripts: str, seg_idxs: tuple, debug: bool = 
             seg_type = SegEinsumType.GENERAL
     else:
         if sum((x is not None) for x in (seg_idx1, seg_idx2)) == 2:
-            match sum((x is not None) for x in (seg_idx12, seg_idx21)):
-                case 0: seg_type = SegEinsumType.OUTER
-                case 1: seg_type = SegEinsumType.MATMUL
-                case 2: seg_type = SegEinsumType.BIDOT
+            seg_type = [SegEinsumType.OUTER,
+                        SegEinsumType.MATMUL,
+                        SegEinsumType.BIDOT][
+                            sum((x is not None) for x in (seg_idx12, seg_idx21))]
         else:
             seg_type = SegEinsumType.GENERAL
 

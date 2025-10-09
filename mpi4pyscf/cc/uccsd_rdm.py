@@ -45,19 +45,19 @@ def _gamma1_intermediates(cc, t1, t2, l1, l2):
     ]
 
     tmpA  = _einsum("imef,jmef->ij", l2_oOxV, t2_oOxV)   # [e],[e]->...
-    tmpA += _einsum("imef,jmef->ij", l2_ooxv, t2_ooxv)
+    tmpA += _einsum("imef,jmef->ij", l2_ooxv, t2_ooxv) * .5
 
     tmpB  = _einsum("mief,mjef->ij", l2_oOxV, t2_oOxV)  # [e],[e]->...
-    tmpB += _einsum("imef,jmef->ij", l2_OOXV, t2_OOXV)
+    tmpB += _einsum("imef,jmef->ij", l2_OOXV, t2_OOXV) * .5
 
     tmpC  = SegArray(np.zeros((nvira_seg, nvira)), seg_idx=0, seg_spin=0, label='tmpC', debug=debug)
-    print(f"t2_oOxV.shape = {t2_oOxV.shape}, l2_oOxV.shape = {l2_oOxV.shape}, tmpC.shape = {tmpC.shape}")
+    # print(f"t2_oOxV.shape = {t2_oOxV.shape}, l2_oOxV.shape = {l2_oOxV.shape}, tmpC.shape = {tmpC.shape}")
     tmpC += _einsum("mnae,mnbe->ab", t2_oOxV, l2_oOxV, out=tmpC)  # [a],[b]->[a]b
-    tmpC += _einsum("mnae,mnbe->ab", t2_ooxv, l2_ooxv, out=tmpC)
+    tmpC += _einsum("mnae,mnbe->ab", t2_ooxv, l2_ooxv, out=tmpC) * .5
 
     tmpD  = _einsum("mnea,mneb->ab", t2_oOxV, l2_oOxV).collect()  # [e],[e]->...
     tmpD2 = SegArray(np.zeros((nvirb_seg, nvirb)), seg_idx=0, seg_spin=1, label='tmpD2', debug=debug)
-    tmpD2 += _einsum("mnae,mnbe->ab", t2_OOXV, l2_OOXV, out=tmpD2)  # [a],[b]->[a]b
+    tmpD2 += _einsum("mnae,mnbe->ab", t2_OOXV, l2_OOXV, out=tmpD2) * .5 # [a],[b]->[a]b
     tmpD += tmpD2.collect()
 
     tmpA, tmpB, tmpC, tmpD = (x.collect().data for x in (tmpA, tmpB, tmpC, tmpD))

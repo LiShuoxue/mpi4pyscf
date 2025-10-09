@@ -383,6 +383,7 @@ def _contract_s2vvvv_fast(xvvv, t2_OxV, out=None, max_memory=2000, same_spin=Fal
 def _add_vvvv(t1, t2, eris, vlocs=None, max_memory=2000):
 
     def _expand_Ovv(t2_tril):
+        # tril O index -> full O index
         assert t2_tril.ndim == 3
         nocc_pair, nvira, nvirb = t2_tril.shape
         nocc = int(np.sqrt(2 * nocc_pair)) + 1

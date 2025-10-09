@@ -71,8 +71,8 @@ def get_scf_solver_model(fname: str):
 def get_scf_solver_O2():
     mol = gto.Mole().set(
         atom=[
-        [8 , (0., +1.200, 0.)],
-        [8 , (0., -1.200, 0.)],],
+        [8 , (0., +2.000, 0.)],
+        [8 , (0., -2.000, 0.)],],
         basis='cc-pvdz',
         spin=0,
     ).build()
@@ -181,26 +181,38 @@ def test_make_tau(mf: UIHF):
 
 def test_add_vvvv(mf: UIHF):
 
+    ENABLE_MPI_PROFILE = False
+    ENABLE_SERIAL_PROFILE = False
+
     cc_mpi = UICCSD_MPI(mf).set(verbose=7)
-    pr = cProfile.Profile()
-    pr.enable()
+
+    if ENABLE_MPI_PROFILE:
+        pr = cProfile.Profile()
+        pr.enable()
+
     if rank == 0:
         print("Testing UCCSD add_vvvv ...")
     res = testfuncs.test_add_vvvv(cc_mpi)
-    pr.disable()
-    pr.dump_stats(f'test_add_vvvv_np1.prof')
+    if ENABLE_MPI_PROFILE:
+        pr.disable()
+        pr.dump_stats(f'test_add_vvvv_np1.prof')
     cc_mpi = None
 
-    """
     if rank == 0:
         cc_ref = UICCSD(mf)
         eris = cc_ref.ao2mo()
         _, t1_ref, t2_ref = cc_ref.init_amps()
-        pr = cProfile.Profile()
-        pr.enable()
+
+        if ENABLE_SERIAL_PROFILE:
+            pr = cProfile.Profile()
+            pr.enable()
+
         oovvs_ref = pyscf_uccsd._add_vvvv(cc_ref, t1_ref, t2_ref, eris=eris)
-        pr.disable()
-        pr.dump_stats(f'test_add_vvvv_serial.prof')
+
+        if ENABLE_SERIAL_PROFILE:
+            pr.disable()
+            pr.dump_stats(f'test_add_vvvv_serial.prof')
+
         keys = ('oovv_aa', 'oovv_ab', 'oovv_bb')
         ref = {k: oovvs_ref[i] for i, k in enumerate(keys)}
         print("oovv results:")
@@ -208,7 +220,6 @@ def test_add_vvvv(mf: UIHF):
             diff = np.abs(res[k] - ref[k]).max()
             norm = np.linalg.norm(ref[k])
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
-    """
 
 
 def test_update_amps_checkpoint(mf: UIHF, checkpoint: int = 10):
@@ -225,7 +236,6 @@ def test_update_amps_checkpoint(mf: UIHF, checkpoint: int = 10):
             diff = np.abs(res[k] - ref[k]).max()
             norm = np.linalg.norm(ref[k])
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
-            # assert np.allclose(diff, 0.0)``
 
 
 def test_update_amps(mf: UIHF):
@@ -324,9 +334,12 @@ def test_update_lambda(mf: UIHF):
         t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris_ref)
         l1_ref, l2_ref = t10, t20
         imds_ref = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris_ref)
-        (l1a, l1b), (l2aa, l2ab, l2bb) = pyscf_uccsd_lambda.update_lambda(
-            cc_ref, t1=t1_ref, t2=t2_ref, l1=l1_ref, l2=l2_ref, eris=eris_ref, imds=imds_ref
+        for _ in range(3):
+            l1_ref, l2_ref = pyscf_uccsd_lambda.update_lambda(
+                cc_ref, t1=t1_ref, t2=t2_ref, l1=l1_ref, l2=l2_ref,
+                eris=eris_ref, imds=imds_ref
         )
+        (l1a, l1b), (l2aa, l2ab, l2bb) = l1_ref, l2_ref
         ref = dict(l1a=l1a, l1b=l1b, l2aa=l2aa, l2ab=l2ab, l2bb=l2bb)
         for k in res:
             diff = np.abs(res[k] - ref[k]).max()
@@ -375,18 +388,58 @@ def test_ccsd_kernel(mf: UIHF):
         assert np.allclose(diff, 0.0)
 
 
-def test_ccsd_rdm(mf: UIHF):
+def test_rdm_single_shot(mf: UIHF):
+    UPDATE_STEP = 3
+    cc_mpi = UICCSD_MPI(mf).set(verbose=7)
+    rdm_mpi = testfuncs.test_rdm_single_shot(cc_mpi)
+
+    if rank == 0:
+        cc_ref = UICCSD(mf)
+        eris = cc_ref.ao2mo()
+        _, t1_ref, t2_ref = cc_ref.init_amps()
+        for _ in range(UPDATE_STEP):
+            t1_ref, t2_ref = cc_ref.update_amps(t1_ref, t2_ref, eris=eris)
+        l1_ref, l2_ref = t1_ref, t2_ref
+        imds = pyscf_uccsd_lambda.make_intermediates(cc_ref, t1_ref, t2_ref, eris)
+        for _ in range(UPDATE_STEP):
+            l1_ref, l2_ref = pyscf_uccsd_lambda.update_lambda(
+                cc_ref, t1=t1_ref, t2=t2_ref, l1=l1_ref, l2=l2_ref, eris=eris,
+                imds=imds
+            )
+        rdm1_ref = cc_ref.make_rdm1(t1=t1_ref, t2=t2_ref,
+                                    l1=l1_ref, l2=l2_ref, ao_repr=True)
+        rdm2_ref = cc_ref.make_rdm2(t1=t1_ref, t2=t2_ref,
+                                    l1=l1_ref, l2=l2_ref, ao_repr=True)
+        rdm_ref = dict(
+            t1a=t1_ref[0], t1b=t1_ref[1],
+            t2aa=t2_ref[0], t2ab=t2_ref[1], t2bb=t2_ref[2],
+            l1a=l1_ref[0], l1b=l1_ref[1],
+            l2aa=l2_ref[0], l2ab=l2_ref[1], l2bb=l2_ref[2],
+            rdm1a=rdm1_ref[0], rdm1b=rdm1_ref[1],
+            rdm2aa=rdm2_ref[0], rdm2ab=rdm2_ref[1], rdm2bb=rdm2_ref[2])
+
+        for k in rdm_mpi:
+            diff = np.abs(rdm_mpi[k] - rdm_ref[k]).max()
+            norm = np.linalg.norm(rdm_ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+
+
+def test_ccsd_all(mf: UIHF):
     cc_mpi = UICCSD_MPI(mf).set(verbose=5)
     cc_mpi.kernel()
     t1_mpi, t2_mpi = cc_mpi.gather_amplitudes()
-    print(f"t1_mpi.shape = {t1_mpi[0].shape} {t1_mpi[1].shape}")
-    print(f"t2_mpi.shape = {t2_mpi[0].shape} {t2_mpi[1].shape} {t2_mpi[2].shape}")
-
     # Should use args rather than kwargs (e.g. t1=t1_mpi, t2=t2_mpi) here.
     cc_mpi.distribute_amplitudes_(t1_mpi, t2_mpi)
-    # cc_mpi.solve_lambda()
+
     rdm1 = cc_mpi.make_rdm1(ao_repr=True)
     rdm2 = cc_mpi.make_rdm2(ao_repr=True)
+    l1_mpi, l2_mpi = cc_mpi.gather_lambda()
+
+    res_mpi = dict(
+        e_corr=cc_mpi.e_corr,
+        t1=np.array(t1_mpi), t2=np.array(t2_mpi),
+        l1=np.array(l1_mpi), l2=np.array(l2_mpi),
+        rdm1=np.array(rdm1), rdm2=np.array(rdm2))
 
     if rank == 0:
         cc_ref = UICCSD(mf).set(verbose=5)
@@ -394,31 +447,32 @@ def test_ccsd_rdm(mf: UIHF):
         rdm1_ref = cc_ref.make_rdm1(ao_repr=True)
         rdm2_ref = cc_ref.make_rdm2(t1=cc_ref.t1, t2=cc_ref.t2, l1=cc_ref.l1, l2=cc_ref.l2, ao_repr=True)
 
-        rdm1 = np.array(rdm1)
-        rdm2 = np.array(rdm2)
-        rdm1_ref = np.array(rdm1_ref)
-        rdm2_ref = np.array(rdm2_ref)
+        res_ref = dict(
+            e_corr=cc_ref.e_corr,
+            t1=np.array(cc_ref.t1), t2=np.array(cc_ref.t2),
+            l1=np.array(cc_ref.l1), l2=np.array(cc_ref.l2),
+            rdm1=np.array(rdm1_ref), rdm2=np.array(rdm2_ref),
+        )
 
-        diff_rdm1 = np.abs(rdm1 - rdm1_ref).max()
-        diff_rdm2 = np.abs(rdm2 - rdm2_ref).max()
-        norm_rdm1 = np.linalg.norm(rdm1_ref)
-        norm_rdm2 = np.linalg.norm(rdm2_ref)
-        # RDM relative difference ~1e-4, since the DIIS procedure of mpi-ccsd and ccsd are not the same currently.
-        print(f"Difference of RDM1: {diff_rdm1} / {norm_rdm1} = {diff_rdm1/norm_rdm1}")
-        print(f"Difference of RDM2: {diff_rdm2} / {norm_rdm2} = {diff_rdm2/norm_rdm2}")
+        for k in res_mpi:
+            diff = np.abs(res_mpi[k] - res_ref[k]).max()
+            norm = np.linalg.norm(res_ref[k])
+            print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
 
 
 if __name__ == "__main__":
     from mpi4pyscf.cc.test.conftest import H2O_mol, H2O_trimer_mol, H2O_dimer_mol
     import sys
 
-    task = sys.argv[1]
+    task = 'all'
+    if len(sys.argv) > 1:
+        task = sys.argv[1]
     if len(sys.argv) < 3: chkpt = None
     else: chkpt = int(sys.argv[2])
 
-    mf = get_scf_solver_mol(mol=H2O_trimer_mol(), chkfile='./data/chk_h2o_trimer_uhf.h5')
+    # mf = get_scf_solver_mol(mol=H2O_trimer_mol(), chkfile='./data/chk_h2o_trimer_uhf.h5')
     # mf = get_scf_solver_O2()
-    # mf = get_scf_solver_mol(mol=H2O_mol())
+    mf = get_scf_solver_mol(mol=H2O_mol())
 
     if task == "eris": test_uiccsd_eris(mf)
     elif task == "init_amps": test_init_amps(mf)
@@ -426,7 +480,8 @@ if __name__ == "__main__":
     elif task == "vvvv": test_add_vvvv(mf)
     elif task == 'energy': test_energy(mf)
     elif task == "kernel": test_ccsd_kernel(mf)
-    elif task == "rdm": test_ccsd_rdm(mf)
+    elif task == "rdm": test_rdm_single_shot(mf)
+    elif task == 'all': test_ccsd_all(mf)
 
     elif task == "amps":
         if chkpt is None: test_update_amps(mf)
