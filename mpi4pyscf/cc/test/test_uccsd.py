@@ -1,7 +1,6 @@
 import numpy as np
 import h5py
 import os
-import pytest
 from scipy import linalg as la
 
 from mpi4pyscf.tools import mpi
@@ -14,7 +13,7 @@ from libdmet.solver.cc_solver import UICCSD
 from mpi4pyscf.cc.uccsd import UICCSD as UICCSD_MPI
 from mpi4pyscf.cc.test import _test_uccsd as testfuncs
 
-import cProfile, pstats
+import cProfile
 
 rank = mpi.rank
 comm = mpi.comm
@@ -460,6 +459,45 @@ def test_ccsd_all(mf: UIHF):
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
 
 
+def test_restore(mf: UIHF):
+    """
+    Test whether the vector<->amplitudes conversion is correct.
+    """
+    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+    cc_mpi.kernel()
+    cc_mpi.make_rdm1(ao_repr=True)
+    t1_mpi, t2_mpi = cc_mpi.gather_amplitudes()
+    l1_mpi, l2_mpi = cc_mpi.gather_lambda()
+    cc_mpi.save_amps(fname='./data/fcc')
+    cc_mpi = None
+
+    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+    cc_mpi.restore_from_h5(fname='./data/fcc')
+    t1_loaded, t2_loaded = cc_mpi.gather_amplitudes()
+    l1_loaded, l2_loaded = cc_mpi.gather_lambda()
+
+    t1_mpi, t2_mpi, t1_loaded, t2_loaded = map(np.array, (t1_mpi, t2_mpi, t1_loaded, t2_loaded))
+    l1_mpi, l2_mpi, l1_loaded, l2_loaded = map(np.array, (l1_mpi, l2_mpi, l1_loaded, l2_loaded))
+
+    diff_t1 = np.abs(t1_loaded - t1_mpi).max()
+    diff_t2 = np.abs(t2_loaded - t2_mpi).max()
+    diff_l1 = np.abs(l1_loaded - l1_mpi).max()
+    diff_l2 = np.abs(l2_loaded - l2_mpi).max()
+    norm_t1 = np.linalg.norm(t1_mpi)
+    norm_t2 = np.linalg.norm(t2_mpi)
+    norm_l1 = np.linalg.norm(l1_mpi)
+    norm_l2 = np.linalg.norm(l2_mpi)
+
+    print(f"Difference of t1: {diff_t1} / {norm_t1} = {diff_t1/norm_t1}")
+    print(f"Difference of t2: {diff_t2} / {norm_t2} = {diff_t2/norm_t2}")
+    print(f"Difference of l1: {diff_l1} / {norm_l1} = {diff_l1/norm_l1}")
+    print(f"Difference of l2: {diff_l2} / {norm_l2} = {diff_l2/norm_l2}")
+    assert np.allclose(diff_t1, 0.0)
+    assert np.allclose(diff_t2, 0.0)
+    assert np.allclose(diff_l1, 0.0)
+    assert np.allclose(diff_l2, 0.0)
+
+
 if __name__ == "__main__":
     from mpi4pyscf.cc.test.conftest import H2O_mol, H2O_trimer_mol, H2O_dimer_mol
     import sys
@@ -482,6 +520,7 @@ if __name__ == "__main__":
     elif task == "kernel": test_ccsd_kernel(mf)
     elif task == "rdm": test_rdm_single_shot(mf)
     elif task == 'all': test_ccsd_all(mf)
+    elif task == "restore": test_restore(mf)
 
     elif task == "amps":
         if chkpt is None: test_update_amps(mf)

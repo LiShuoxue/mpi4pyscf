@@ -54,6 +54,8 @@ def kernel(mycc, eris=None, t1=None, t2=None, max_cycle=50, tol=1e-8,
     elif t2 is None:
         t2 = mycc.get_init_guess(eris)[1]
 
+    print(f"rank = {rank} t2aa.shape = {t2[0].shape}")
+
     eold = 0
     eccsd = mycc.energy(t1, t2, eris)
     log.info('Init E(CCSD) = %.15g', eccsd)

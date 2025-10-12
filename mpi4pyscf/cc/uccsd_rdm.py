@@ -211,8 +211,7 @@ def _gamma2_intermediates(cc, t1, t2, l1, l2, compress_vvvv=False):
     goOvV -= einsum('kiba,kj->jiba', tau_oOxV, tmpa) * .5
     gOOVV += einsum('kiab,kj->ijab', tau_OOXV, tmpb) * .5
 
-    # ldjd->lj contraction by itself not implemented yet 
-    raise NotImplementedError("Unfinished.")
+    raise NotImplementedError("Unfinished (ldjd->lj contraction by itself not implemented yet).")
 
 
 @mpi.parallel_call
@@ -237,8 +236,7 @@ def make_rdm1(mycc, t1, t2, l1, l2, ao_repr=False, with_frozen=True, with_mf=Tru
         l2 = mycc.l2
     if l1 is None:
         l1, l2 = mycc.solve_lambda(t1, t2)
-    # t1, t2 = mpi_uccsd.gather_amplitudes(mycc, t1, t2)
-    # l1, l2 = mpi_uccsd.gather_lambda(mycc, l1, l2)
+
     d1 = _gamma1_intermediates(mycc, t1, t2, l1, l2)
     return uccsd_rdm._make_rdm1(mycc, d1, with_frozen=with_frozen, ao_repr=ao_repr, with_mf=with_mf)
 

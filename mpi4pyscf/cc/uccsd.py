@@ -18,6 +18,7 @@ from mpi4pyscf.cc.ccsd import _sync_, _pack_scf, _task_location
 from mpi4pyscf.cc import ccsd as mpi_rccsd
 from mpi4pyscf.cc import cc_tools as tools
 from mpi4pyscf.cc.cc_tools import SegArray
+from mpi4pyscf.cc.gccsd import load_amps, save_amps
 
 
 BLKMIN = getattr(__config__, 'cc_ccsd_blkmin', 4)
@@ -363,6 +364,8 @@ def _contract_s2vvvv_fast(xvvv, t2_OxV, out=None, max_memory=2000, same_spin=Fal
         for j0, j1 in lib.prange(0, nvirb, blksize):
             jc = j1 - j0 # index D
             _tmp = t2_OxV[:, :, j0:j1].transpose(0, 2, 1).reshape(nocc_tot, pc * jc)
+            _tmp = np.asarray(_tmp, order='C')
+            # print(f'{_tmp.flags}')
             for i0, i1 in lib.prange(0, nvirb, blksize):
                 ic = i1 - i0 # index B
                 # [a]<c>BD -> {D<c>} {B[a]}
@@ -1161,6 +1164,8 @@ def energy(cc, t1=None, t2=None, eris=None):
     tmp2bb = _einsum("jb,ibja->ia", t1_OX, OXOV).set(label='tmp2bb').collect()
     tmp1ab = _einsum('JB,iaJB->ia', t1b, oxOV).set(label='tmp1ab')
 
+    print(f"t2_ooxv.shape = {t2_ooxv.shape}, oxov.shape = {oxov.shape}")
+
     e = 0.25 * _einsum('ijab,iajb->', t2_ooxv, oxov)
     e -= 0.25 * _einsum('ijab,ibja->', t2_ooxv, oxov)
     e += 0.25 * _einsum('ijab,iajb->', t2_OOXV, OXOV)
@@ -1307,6 +1312,113 @@ def _release_regs(mycc, remove_h2=False):
     gc.collect()
 
 
+# LibDMET2 interfaces
+
+def transform_t1_to_bo(t1, u):
+    from mpi4pyscf.cc.gccsd import transform_t1_to_bo as _fn_gccsd
+    return [_fn_gccsd(t1[s], u[s]) for s in (0, 1)]
+
+def transform_t2_to_bo(t2, u, vlocss=None):
+    ua, ub = u
+    t2_ooxv, t2_oOxV, t2_OOXV = t2
+    nocc_a, nocc_b, nvira_seg, nvir_b = t2_oOxV.shape
+    nvirb_seg = t2_OOXV.shape[2]
+    nvir_a = t2_ooxv.shape[3]
+    vlocs_a, vlocs_b = map(tools.get_vlocs, (nvir_a, nvir_b))
+    (vloc0a, vloc1a), (vloc0b, vloc1b) = vlocs_a[rank], vlocs_b[rank]
+    slc_va, slc_vb = slice(vloc0a, vloc1a), slice(vloc0b, vloc1b)
+
+    _einsum = partial(einsum_sz, nvira_or_vlocsa=vlocs_a, nvirb_or_vlocsb=vlocs_b)
+
+    if vlocss is None:
+        vlocs_a = tools.get_vlocs(nvir_a)
+        vlocs_b = tools.get_vlocs(nvir_b)
+        vlocss = (vlocs_a, vlocs_b)
+    vlocs_a, vlocs_b = vlocss
+
+    umat_occ_a, umat_occ_b = ua[:nocc_a, :nocc_a], ub[:nocc_b, :nocc_b]
+    umat_vir_a, umat_vir_b = ua[nocc_a:, nocc_a:], ub[nocc_b:, nocc_b:]
+
+    t2_ooxv_tmp = np.einsum("ijxb,iI,jJ,bB->IJxB", t2_ooxv,
+                            umat_occ_a, umat_occ_a, umat_vir_a)
+    t2_OOXV_tmp = np.einsum("ijxb,iI,jJ,bB->IJxB", t2_OOXV,
+                            umat_occ_b, umat_occ_b, umat_vir_b)
+    t2_oOxV_tmp = np.einsum("ijxb,iI,jJ,bB->IJxB", t2_oOxV,
+                            umat_occ_a, umat_occ_b, umat_vir_b)
+
+    t2_ooxv_tmp = SegArray(t2_ooxv_tmp, seg_idx=2, seg_spin=0, label='t2aa_tmp')
+    t2_OOXV_tmp = SegArray(t2_OOXV_tmp, seg_idx=2, seg_spin=1, label='t2bb_tmp')
+    t2_oOxV_tmp = SegArray(t2_oOxV_tmp, seg_idx=2, seg_spin=0, label='t2ab_tmp')
+
+    uvir_a = SegArray(umat_vir_a, label='uvir_a', reduced=True)
+    uvir_b = SegArray(umat_vir_b, label='uvir_b', reduced=True)
+    u_xv = uvir_a[slc_va].set(label='u_xv')
+    u_XV = uvir_b[slc_vb].set(label='u_XV')
+
+    t2_ooxv_bo = SegArray(np.zeros((nocc_a, nocc_a, nvira_seg, nvir_a)),
+                          seg_idx=2, seg_spin=0, label='t2aa_bo')
+    t2_OOXV_bo = SegArray(np.zeros((nocc_b, nocc_b, nvirb_seg, nvir_b)),
+                          seg_idx=2, seg_spin=1, label='t2bb_bo')
+    t2_oOxV_bo = SegArray(np.zeros((nocc_a, nocc_b, nvira_seg, nvir_b)),
+                          seg_idx=2, seg_spin=0, label='t2ab_bo')
+    t2_ooxv_bo += _einsum("IJxB,xX->IJXB", t2_ooxv_tmp, u_xv)
+    t2_OOXV_bo += _einsum("IJxB,xX->IJXB", t2_OOXV_tmp, u_XV)
+    t2_oOxV_bo += _einsum("IJxB,xX->IJXB", t2_oOxV_tmp, u_xv)
+
+    return (t2_ooxv_bo.data, t2_oOxV_bo.data, t2_OOXV_bo.data)
+    
+
+transform_l1_to_bo = transform_t1_to_bo
+transform_l2_to_bo = transform_t2_to_bo
+
+
+@mpi.parallel_call
+def restore_from_h5(mycc, fname="fcc", umat=None, only_t=False):
+    """
+    Restore t1, t2, l1, l2 from file.
+
+    Args:
+        mycc: CC object.
+        fname: prefix for the filename.
+        umat: (nmo, nmo), rotation matrix to rotate amps.
+        only_t: if yes, will only load t1, t2; set l1, l2 to None.
+
+    Return:
+        mycc: CC object, with t1, t2, l1, l2 updated.
+    """
+    import os
+
+    _sync_(mycc)
+    if fname.endswith(".h5"):
+        fname = fname[:-3]
+    filename = fname + '__rank' + str(rank) + ".h5"
+    logger.info(mycc, "restore amps from %s (rank 0/%s) ...",
+                filename, mpi.pool.size)
+    if all(comm.allgather(os.path.isfile(filename))):
+        t1, t2, l1, l2, mo_coeff = mycc.load_amps(fname=fname, only_t=only_t)
+        if umat is not None:
+            logger.info(mycc, "rotate amps ...")
+            nvira, nvirb = t1[0].shape[1], t1[1].shape[1]
+            ntasks = mpi.pool.size
+            vlocs_a, vlocs_b = tools.get_vlocs(nvira), tools.get_vlocs(nvirb)
+            vlocss = (vlocs_a, vlocs_b)
+            t1 = transform_t1_to_bo(t1, umat)
+            t2 = transform_t2_to_bo(t2, umat, vlocss=vlocss)
+            
+            if l1 is not None:
+                l1 = transform_l1_to_bo(l1, umat)
+            if l2 is not None:
+                l2 = transform_l2_to_bo(l2, umat, vlocss=vlocss)
+
+        mycc.t1 = t1
+        mycc.t2 = t2
+        mycc.l1 = l1
+        mycc.l2 = l2
+    else:
+        raise ValueError("restore_from_h5 failed, (part of) files %s not exist."%filename)
+    return mycc
+
+
 class UCCSD(pyscf_uccsd.UCCSD):
     """MPI version"""
     conv_tol = getattr(__config__, 'cc_gccsd_GCCSD_conv_tol', 1e-7)
@@ -1314,6 +1426,9 @@ class UCCSD(pyscf_uccsd.UCCSD):
 
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None):
         pyscf_uccsd.UCCSD.__init__(self, mf, frozen, mo_coeff, mo_occ)
+        self.init_regs()
+
+    def init_regs(self):
         regs = mpi.pool.apply(_init_uccsd, (self, ), (None, ))
         self._reg_procs = regs
 
@@ -1365,6 +1480,9 @@ class UCCSD(pyscf_uccsd.UCCSD):
 
         self.e_hf = self.get_e_hf()
 
+        if t1 is not None:
+            print(f"In UCCSD_MPI.ccsd: t1.shape = {t1.shape} , t2.shape = {t2.shape}")
+
         self.converged, self.e_corr, self.t1, self.t2 = \
             mpi_rccsd.kernel(self, eris, t1, t2, max_cycle=self.max_cycle,
                              tol=self.conv_tol, tolnormt=self.conv_tol_normt,
@@ -1380,7 +1498,8 @@ class UCCSD(pyscf_uccsd.UCCSD):
             self, eris, t1, t2, l1, l2,
             max_cycle=self.max_cycle,
             tol=self.conv_tol_normt,
-            verbose=self.verbose
+            verbose=self.verbose,
+            approx_l=approx_l,
         )
         return self.l1, self.l2
 
@@ -1426,10 +1545,21 @@ class UCCSD(pyscf_uccsd.UCCSD):
     gather_amplitudes = gather_amplitudes
     gather_lambda = gather_lambda
 
+    # DMET interfaces
+    load_amps = load_amps
+    save_amps = save_amps
+    restore_from_h5 = restore_from_h5
+
 
 class UICCSD(UCCSD):
+    """
+    MPI version of UICCSD
+    """
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None):
         pyscf_uccsd.UCCSD.__init__(self, mf, frozen, mo_coeff, mo_occ)
+        self.init_regs()
+
+    def init_regs(self):
         regs = mpi.pool.apply(_init_uiccsd, (self, ), (None, ))
         self._reg_procs = regs
 

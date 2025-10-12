@@ -853,7 +853,7 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
 @mpi.parallel_call(skip_args=[1], skip_kwargs=['eris'])
 def kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
            max_cycle=50, tol=1e-8, verbose=logger.INFO,
-           fintermediates=None, fupdate=None):
+           fintermediates=None, fupdate=None, approx_l=False):
     log = logger.new_logger(mycc, verbose)
     cput0 = (logger.process_clock(), logger.perf_counter())
     _sync_(mycc)
@@ -866,6 +866,12 @@ def kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
     if l2 is None:
         if mycc.l2 is None: l2 = t2
         else: l2 = mycc.l2
+
+    if approx_l:
+        mycc.l1 = l1
+        mycc.l2 = l2
+        conv = True
+        return conv, l1, l2
 
     eris = getattr(mycc, '_eris', None)
     if eris is None:
