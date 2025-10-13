@@ -9,8 +9,9 @@ from pyscf.cc import uccsd as pyscf_uccsd
 from pyscf.cc import uccsd_lambda as pyscf_uccsd_lambda
 
 from libdmet.solver.scf import UIHF
-from libdmet.solver.cc_solver import UICCSD
+from libdmet.solver.cc_solver import UICCSD, UICCSD_KRYLOV
 from mpi4pyscf.cc.uccsd import UICCSD as UICCSD_MPI
+from mpi4pyscf.cc.uccsd_krylov import UICCSD_KRYLOV as UICCSD_KRYLOV_MPI
 from mpi4pyscf.cc.test import _test_uccsd as testfuncs
 
 import cProfile
@@ -237,9 +238,9 @@ def test_update_amps_checkpoint(mf: UIHF, checkpoint: int = 10):
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
 
 
-def test_update_amps(mf: UIHF):
+def test_update_amps(mf: UIHF, with_vector: bool = False):
     cc_mpi = UICCSD_MPI(mf).set(verbose=7)
-    res = testfuncs.test_update_amps(cc_mpi)
+    res = testfuncs.test_vector(cc_mpi) if with_vector else testfuncs.test_update_amps(cc_mpi)
     if rank == 0:
         cc_ref = UICCSD(mf)
         eris = cc_ref.ao2mo()
@@ -423,40 +424,53 @@ def test_rdm_single_shot(mf: UIHF):
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
 
 
-def test_ccsd_all(mf: UIHF):
-    cc_mpi = UICCSD_MPI(mf).set(verbose=5)
+def test_ccsd_all(mf: UIHF, krylov: bool = False, run_rdm: bool = True):
+    """
+    Current stage:
+    krylov amp equation correct; lambda equation not correct.
+    """
+    cls_mpi, cls_serial = [(UICCSD_MPI, UICCSD), (UICCSD_KRYLOV_MPI, UICCSD_KRYLOV)][krylov]
+
+    cc_mpi = cls_mpi(mf).set(verbose=5)
     cc_mpi.kernel()
     t1_mpi, t2_mpi = cc_mpi.gather_amplitudes()
+
     # Should use args rather than kwargs (e.g. t1=t1_mpi, t2=t2_mpi) here.
     cc_mpi.distribute_amplitudes_(t1_mpi, t2_mpi)
 
-    rdm1 = cc_mpi.make_rdm1(ao_repr=True)
-    rdm2 = cc_mpi.make_rdm2(ao_repr=True)
-    l1_mpi, l2_mpi = cc_mpi.gather_lambda()
+    if run_rdm:
+        rdm1 = cc_mpi.make_rdm1(ao_repr=True)
+        rdm2 = cc_mpi.make_rdm2(ao_repr=True)
+        l1_mpi, l2_mpi = cc_mpi.gather_lambda()
 
     res_mpi = dict(
         e_corr=cc_mpi.e_corr,
-        t1=np.array(t1_mpi), t2=np.array(t2_mpi),
-        l1=np.array(l1_mpi), l2=np.array(l2_mpi),
-        rdm1=np.array(rdm1), rdm2=np.array(rdm2))
+        t1=np.array(t1_mpi), t2=np.array(t2_mpi))
+    if run_rdm:
+        res_mpi.update(l1=np.array(l1_mpi), l2=np.array(l2_mpi),
+            rdm1=np.array(rdm1), rdm2=np.array(rdm2))
 
     if rank == 0:
-        cc_ref = UICCSD(mf).set(verbose=5)
+        cc_ref = cls_serial(mf).set(verbose=5)
         cc_ref.kernel()
-        rdm1_ref = cc_ref.make_rdm1(ao_repr=True)
-        rdm2_ref = cc_ref.make_rdm2(t1=cc_ref.t1, t2=cc_ref.t2, l1=cc_ref.l1, l2=cc_ref.l2, ao_repr=True)
+
+        if run_rdm:
+            rdm1_ref = cc_ref.make_rdm1(ao_repr=True)
+            rdm2_ref = cc_ref.make_rdm2(t1=cc_ref.t1, t2=cc_ref.t2, l1=cc_ref.l1, l2=cc_ref.l2, ao_repr=True)
 
         res_ref = dict(
             e_corr=cc_ref.e_corr,
-            t1=np.array(cc_ref.t1), t2=np.array(cc_ref.t2),
-            l1=np.array(cc_ref.l1), l2=np.array(cc_ref.l2),
-            rdm1=np.array(rdm1_ref), rdm2=np.array(rdm2_ref),
-        )
+            t1=np.array(cc_ref.t1), t2=np.array(cc_ref.t2))
+        
+        if run_rdm:
+            res_ref.update(l1=np.array(cc_ref.l1), l2=np.array(cc_ref.l2),
+            rdm1=np.array(rdm1_ref), rdm2=np.array(rdm2_ref))
 
         for k in res_mpi:
             diff = np.abs(res_mpi[k] - res_ref[k]).max()
             norm = np.linalg.norm(res_ref[k])
             print(f"Difference of {k}: {diff} / {norm} = {diff/norm}")
+            assert np.allclose(diff, 0.0, rtol=1e-8)
 
 
 def test_restore(mf: UIHF):
@@ -468,7 +482,9 @@ def test_restore(mf: UIHF):
     cc_mpi.make_rdm1(ao_repr=True)
     t1_mpi, t2_mpi = cc_mpi.gather_amplitudes()
     l1_mpi, l2_mpi = cc_mpi.gather_lambda()
+
     cc_mpi.save_amps(fname='./data/fcc')
+    cc_mpi._release_regs()
     cc_mpi = None
 
     cc_mpi = UICCSD_MPI(mf).set(verbose=5)
@@ -502,7 +518,7 @@ if __name__ == "__main__":
     from mpi4pyscf.cc.test.conftest import H2O_mol, H2O_trimer_mol, H2O_dimer_mol
     import sys
 
-    task = 'all'
+    task = 'uccsd'
     if len(sys.argv) > 1:
         task = sys.argv[1]
     if len(sys.argv) < 3: chkpt = None
@@ -519,12 +535,16 @@ if __name__ == "__main__":
     elif task == 'energy': test_energy(mf)
     elif task == "kernel": test_ccsd_kernel(mf)
     elif task == "rdm": test_rdm_single_shot(mf)
-    elif task == 'all': test_ccsd_all(mf)
+    elif task == 'uccsd': test_ccsd_all(mf, krylov=False, run_rdm=True)
+    elif task == 'krylov': test_ccsd_all(mf, krylov=True, run_rdm=True)
     elif task == "restore": test_restore(mf)
 
     elif task == "amps":
         if chkpt is None: test_update_amps(mf)
         else: test_update_amps_checkpoint(mf, checkpoint=chkpt)
+
+    elif task == "vector":
+        test_update_amps(mf, with_vector=True)
 
     elif task == "imds":
         if chkpt is None: test_lambda_intermediates(mf)

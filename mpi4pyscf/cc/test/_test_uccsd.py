@@ -1120,3 +1120,23 @@ def test_rdm_single_shot(cc: UCCSD_MPI):
                    rdm2aa=rdm2[0], rdm2ab=rdm2[1], rdm2bb=rdm2[2])
 
     return res
+
+
+@mpi.parallel_call
+def test_vector(cc: UCCSD_MPI):
+    if getattr(cc, '_eris', None) is None:
+        cc.ao2mo(cc.mo_coeff)
+    _, t1, t2 = cc.init_amps()
+    for _ in range(3):
+        t1, t2 = cc.update_amps(t1, t2, cc._eris)
+
+    v = cc.amplitudes_to_vector(t1, t2)
+
+    assert v.size == cc.vector_size(), f"rank {rank} real vector size {v.size} calculated vector size {cc.vector_size()}"
+
+    (t1a, t1b), (t2aa, t2ab, t2bb) = cc.vector_to_amplitudes(vec=v)
+
+    res = dict(t1a=t1a, t1b=t1b)
+    for k, v in zip(('t2aa', 't2ab', 't2bb'), (t2aa, t2ab, t2bb)):
+        res[k] = cc_tools.collect_array(v, seg_idx=2)
+    return res

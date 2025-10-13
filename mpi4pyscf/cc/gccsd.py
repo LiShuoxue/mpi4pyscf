@@ -1142,6 +1142,9 @@ class GCCSD(gccsd.GCCSD):
     # Lambda, rdm, ip ea
     # ************************************************************************
 
+    def update_lambda(self, t1, t2, l1, l2, eris, imds):
+        return gccsd_lambda.update_lambda(self, t1, t2, l1, l2, eris, imds)
+
     def solve_lambda(self, t1=None, t2=None, l1=None, l2=None,
                      eris=None, approx_l=False):
         self.converged_lambda, self.l1, self.l2 = \

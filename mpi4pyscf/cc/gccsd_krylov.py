@@ -25,6 +25,7 @@ Usage: mpirun -np 2 python gccsd.py
 from functools import reduce
 import math
 import numpy as np
+import scipy
 import scipy.linalg as la
 from scipy import optimize as opt
 from scipy.sparse import linalg as spla
@@ -266,7 +267,7 @@ def pre_kernel(mycc, eris=None, t1=None, t2=None, max_cycle=50, tol=1e-8,
     vec = mycc.amplitudes_to_vector(t1, t2)
     mycc.vec = mycc.gather_vector(vec)
     # initialize the precond vector
-    mycc.precond_vec = make_precond_vec_finv(mycc, t2, eris)
+    mycc.precond_vec = mycc.make_precond_vec_finv(t2, eris)
     if rank != 0:
         mycc.precond_vec = None
     mycc.cycle = 0
@@ -320,7 +321,7 @@ def distribute_vector_(mycc, vec=None, write='t'):
     vec = vec.ravel()
     if write == 't':
         mycc.t1, mycc.t2 = mycc.vector_to_amplitudes(vec)
-    else:
+    elif write == 'l':
         mycc.l1, mycc.l2 = mycc.vector_to_amplitudes(vec)
     return vec
 
@@ -348,15 +349,20 @@ def get_res(mycc, x):
     log = logger.new_logger(mycc, mycc.verbose)
     eris = getattr(mycc, '_eris', None)
     
-    # firs distribute x to t1 and t2
-    vec = mycc.distribute_vector_(x)
+    # first distribute x to t1 and t2
+    vec = mycc.distribute_vector_(x, write='t')
+    # t1, t2 = mycc.vector_to_amplitudes(vec)
     t1, t2 = mycc.t1, mycc.t2
-
     eccsd = mycc.energy(t1, t2, eris)
     t1, t2 = mycc.update_amps(t1, t2, eris)
 
     # then gather the vector
     res = mycc.amplitudes_to_vector(t1, t2)
+    precond_vec = mycc.distribute_vector_(mycc.precond_vec, write=None)
+
+    # Shuoxue NOTE: get the t(ite-rk) from t(new);t(old) by t1(new) = [t1(ite-rk) + t1(old) * eIA] / eIA
+    res = (res - vec) * precond_vec
+
     norm = safe_max_abs(res)
     norm = comm.allreduce(norm, op=mpi.MPI.MAX)
     log.info("      cycle = %5d , E = %15.8g , norm(res) = %15.5g", mycc.cycle,
@@ -375,8 +381,8 @@ def mop(mycc, x):
     Returns:
         res: x after applied precond.
     """
-    #res = x / mycc.precond_vec
-    #return res
+    x = x.astype(np.result_type(x, mycc.precond_vec), copy=False)
+    # print(f"x.dtype = {x.dtype}, precond_vec.dtype = {mycc.precond_vec.dtype}")
     x /= mycc.precond_vec
     return x
 
@@ -399,19 +405,32 @@ def kernel(mycc):
     if mycc.method == 'krylov':
         inner_m = mycc.inner_m
         outer_k = mycc.outer_k
+        scipy_v = [int(sv) for sv in scipy.__version__.split(".")]
+        if (scipy_v[0] < 1) or ((scipy_v[0] == 1) and (scipy_v[1] < 14)):
+            # scipy version earlier than 1.14.0. Use inner_tol.
+            jac_options = {'rdiff': 1e-6, 'inner_maxiter': 100,
+                           'inner_inner_m': inner_m,
+                           'inner_tol': tolnormt * 0.5,
+                           'outer_k': outer_k, 'inner_M': M
+                           }
+        else:
+            # inner_tol is deprecated from 1.14.0 onwards.
+            jac_options = {'rdiff': 1e-6, 'inner_maxiter': 100,
+                           'inner_inner_m': inner_m,
+                           'inner_rtol': tolnormt * 0.5,
+                           'outer_k': outer_k, 'inner_M': M
+                           }
         res = froot(mycc.get_res, x0, method='krylov',
                     options={'fatol': tolnormt, 'tol_norm': safe_max_abs, 
                              'disp': True, 'maxiter': max_cycle // inner_m,
                              'line_search': 'wolfe',
-                             'jac_options': {'rdiff': 1e-6, 'inner_maxiter': 100, 
-                                             'inner_inner_m': inner_m, 'inner_tol': tolnormt * 0.5,
-                                             'outer_k': outer_k, 'inner_M': M}
+                             'jac_options': jac_options
                             })
     else:
         raise ValueError
 
     conv = res.success
-    mycc.distribute_vector_(res.x)
+    mycc.distribute_vector_(res.x, write='t')
     eccsd = mycc.energy()
     mycc.e_corr = eccsd
     return conv, eccsd, mycc.t1, mycc.t2
@@ -565,7 +584,7 @@ class GGCCSD_KRYLOV(GGCCSD):
                                        max_cycle=self.max_cycle,
                                        tol=self.conv_tol_normt,
                                        verbose=self.verbose, approx_l=approx_l)
-        
+
         if approx_l:
             conv = True
         else:
@@ -583,6 +602,7 @@ class GGCCSD_KRYLOV(GGCCSD):
     remove_amps = remove_amps
     set_zero_amps = set_zero_amps
     analyze_amps = analyze_amps
+    make_precond_vec_finv = make_precond_vec_finv
 
 if __name__ == '__main__':
     from pyscf import gto
@@ -615,7 +635,7 @@ if __name__ == '__main__':
     ecc_ref, t1_cc_ref, t2_cc_ref = mycc_ref.kernel()
 
     # test class
-    mycc = GCCSD(mf)
+    mycc = GGCCSD_KRYLOV(mf)
     mycc.conv_tol = 1e-10
     mycc.conv_tol_normt = 1e-6
 
@@ -634,4 +654,3 @@ if __name__ == '__main__':
         t2_diff = la.norm(t2_cc - t2_cc_ref)
         print (t2_diff)
         assert t2_diff < 1e-7
-

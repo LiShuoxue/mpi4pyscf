@@ -194,22 +194,25 @@ def vector_to_amplitudes(vector, nmo, nocc):
     t1a = t1a_and_t1b[:nova].reshape(nocca, nvira)
     t1b = t1a_and_t1b[nova:].reshape(noccb, nvirb)
     t2_oOxV = vector[-sizeab:].reshape(nocca, noccb, nvira_seg, nvirb)
-    t2_xvoo = lib.unpack_tril(t2aa_tril.reshape(nvira_seg * nvira, nocca_pair), filltriu=lib.PLAIN)
+    t2_xvoo = lib.unpack_tril(t2aa_tril.reshape(nvira_seg * nvira, nocca_pair), filltriu=lib.ANTIHERMI)
     t2_xvoo = t2_xvoo.reshape(nvira_seg, nvira, nocca, nocca)
-    t2_XVOO = lib.unpack_tril(t2bb_tril.reshape(nvirb_seg * nvirb, noccb_pair), filltriu=lib.PLAIN)
+    t2_XVOO = lib.unpack_tril(t2bb_tril.reshape(nvirb_seg * nvirb, noccb_pair), filltriu=lib.ANTIHERMI)
     t2_XVOO = t2_XVOO.reshape(nvirb_seg, nvirb, noccb, noccb)
 
-    (idxa, idya), (idxb, idyb) = map(np.tril_indices, (nocca, noccb))
+    # (idxa, idya), (idxb, idyb) = map(np.tril_indices, (nocca, noccb))
+    # t2_xvoo -= t2_xvoo.transpose(0, 1, 3, 2)
+    # t2_XVOO -= t2_XVOO.transpose(0, 1, 3, 2)
 
+    """
     t2aa_tmp = mpi.alltoall_new([t2aa_tril[:, p0:p1] for p0, p1 in vlocsa], split_recvbuf=True)
     t2bb_tmp = mpi.alltoall_new([t2bb_tril[:, p0:p1] for p0, p1 in vlocsb], split_recvbuf=True)
-
     for task_id, (p0, p1) in enumerate(vlocsa):
-        tmp = t2aa_tmp[task_id].reshape(p1 - p0, nvira_seg, nocca_pair)
-        t2_xvoo[:, p0:p1, idya, idxa] = tmp.transpose(1, 0, 2)
+        tmp = t2aa_tmp[task_id].reshape(nvira_seg, p1 - p0, nocca_pair)
+        t2_xvoo[:, p0:p1, idya, idxa] = - tmp.transpose(1, 0, 2)
     for task_id, (p0, p1) in enumerate(vlocsb):
         tmp = t2bb_tmp[task_id].reshape(p1 - p0, nvirb_seg, noccb_pair)
-        t2_XVOO[:, p0:p1, idyb, idxb] = tmp.transpose(1, 0, 2)
+        t2_XVOO[:, p0:p1, idyb, idxb] = - tmp.transpose(1, 0, 2)
+    """
 
     return (t1a, t1b), (t2_xvoo.transpose(2, 3, 0, 1), t2_oOxV, t2_XVOO.transpose(2, 3, 0, 1))
 
@@ -337,7 +340,7 @@ def _contract_s2vvvv_fast(xvvv, t2_OxV, out=None, max_memory=2000, same_spin=Fal
     # m: I (nocc_tot) n =: {B[a]} (nvira_seg * nvirb (ic)) k: {<c>D} (pc * nvirb (jc))
     # a: mk; b: kn; c: mn
     # FIXME[B01]: Wrong when segments are not the same length when _tmp is defined once,
-    # Currently avoid this error by duplicating slices and use 0 offset.
+    # NOTE: Currently avoid this error by duplicating slices and use 0 offset.
 
     _dgemm = lib.numpy_helper._dgemm
     assert t2_OxV.ndim == 3
@@ -1164,8 +1167,6 @@ def energy(cc, t1=None, t2=None, eris=None):
     tmp2bb = _einsum("jb,ibja->ia", t1_OX, OXOV).set(label='tmp2bb').collect()
     tmp1ab = _einsum('JB,iaJB->ia', t1b, oxOV).set(label='tmp1ab')
 
-    print(f"t2_ooxv.shape = {t2_ooxv.shape}, oxov.shape = {oxov.shape}")
-
     e = 0.25 * _einsum('ijab,iajb->', t2_ooxv, oxov)
     e -= 0.25 * _einsum('ijab,ibja->', t2_ooxv, oxov)
     e += 0.25 * _einsum('ijab,iajb->', t2_OOXV, OXOV)
@@ -1480,8 +1481,8 @@ class UCCSD(pyscf_uccsd.UCCSD):
 
         self.e_hf = self.get_e_hf()
 
-        if t1 is not None:
-            print(f"In UCCSD_MPI.ccsd: t1.shape = {t1.shape} , t2.shape = {t2.shape}")
+        # if t1 is not None:
+            # print(f"In UCCSD_MPI.ccsd: t1.shape = {t1.shape} , t2.shape = {t2.shape}")
 
         self.converged, self.e_corr, self.t1, self.t2 = \
             mpi_rccsd.kernel(self, eris, t1, t2, max_cycle=self.max_cycle,
@@ -1549,6 +1550,32 @@ class UCCSD(pyscf_uccsd.UCCSD):
     load_amps = load_amps
     save_amps = save_amps
     restore_from_h5 = restore_from_h5
+
+    def vector_size(self, nmo=None, nocc=None):
+        if nocc is None: nocc = self.nocc
+        if nmo is None: nmo = self.nmo
+        nmoa, nmob = nmo
+        nocca, noccb = nocc
+        nvira, nvirb = nmoa - nocca, nmob - noccb
+        vlocsa, vlocsb = map(tools.get_vlocs, (nvira, nvirb))
+
+        nvira_seg = vlocsa[rank][1] - vlocsa[rank][0]
+        nvirb_seg = vlocsb[rank][1] - vlocsb[rank][0]
+        nocca_pair = nocca * (nocca + 1) // 2
+        noccb_pair = noccb * (noccb + 1) // 2
+        
+        sizeaa = nvira_seg * nvira * nocca_pair
+        sizebb = nvirb_seg * nvirb * noccb_pair
+        sizeab = nvira_seg * nvirb * nocca * noccb
+        nova, novb = nvira * nocca, nvirb * noccb
+        res = sizeaa + sizebb + sizeab
+        if rank == 0:
+            res += (nova + novb)  # t1a, t1b
+        return res
+
+    def update_lambda(self, t1, t2, l1, l2, eris, imds):
+        from mpi4pyscf.cc import uccsd_lambda
+        return uccsd_lambda.update_lambda(self, t1, t2, l1, l2, eris, imds)
 
 
 class UICCSD(UCCSD):

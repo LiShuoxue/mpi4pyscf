@@ -19,6 +19,7 @@
 import gc
 
 import numpy as np
+import scipy
 from scipy import optimize as opt
 from scipy.sparse import linalg as spla
 from pyscf import lib
@@ -98,7 +99,7 @@ def pre_kernel(mycc, eris=None, t1=None, t2=None, l1=None, l2=None,
     vec = mycc.amplitudes_to_vector(l1, l2)
     mycc.vec = mycc.gather_vector(vec)
     # initialize the precond vector
-    #mycc.precond_vec = make_precond_vec_finv(mycc, l2, eris)
+    mycc.precond_vec = mycc.make_precond_vec_finv(l2, eris)
     mycc.cycle = 0
     return mycc
 
@@ -122,10 +123,13 @@ def get_lambda_res(mycc, x):
     vec = mycc.distribute_vector_(x, write='l')
     l1, l2 = mycc.l1, mycc.l2
 
-    l1, l2 = update_lambda(mycc, t1, t2, l1, l2, eris, imds)
+    l1, l2 = mycc.update_lambda(t1, t2, l1, l2, eris, imds)
 
     # then gather the vector
     res = mycc.amplitudes_to_vector(l1, l2)
+    precond_vec = mycc.distribute_vector_(mycc.precond_vec, write=None)
+    res = (res - vec) * precond_vec
+
     norm = safe_max_abs(res)
     norm = comm.allreduce(norm, op=mpi.MPI.MAX)
     log.info("      cycle = %5d , norm(res) = %15.5g", mycc.cycle, norm)
@@ -161,13 +165,26 @@ def kernel(mycc):
     if mycc.method == 'krylov':
         inner_m = mycc.inner_m
         outer_k = mycc.outer_k
+        scipy_v = [int(sv) for sv in scipy.__version__.split(".")]
+        if (scipy_v[0] < 1) or ((scipy_v[0] == 1) and (scipy_v[1] < 14)):
+            # scipy version earlier than 1.14.0. Use inner_tol.
+            jac_options = {'rdiff': 1e-6, 'inner_maxiter': 100,
+                           'inner_inner_m': inner_m,
+                           'inner_tol': tolnormt * 0.5,
+                           'outer_k': outer_k, 'inner_M': M
+                           }
+        else:
+            # inner_tol is deprecated from 1.14.0 onwards.
+            jac_options = {'rdiff': 1e-6, 'inner_maxiter': 100,
+                           'inner_inner_m': inner_m,
+                           'inner_rtol': tolnormt * 0.5,
+                           'outer_k': outer_k, 'inner_M': M
+                           }
         res = froot(f_res, x0, method='krylov',
                     options={'fatol': tolnormt, 'tol_norm': safe_max_abs, 
                              'disp': True, 'maxiter': max_cycle // inner_m,
                              'line_search': 'wolfe',
-                             'jac_options': {'rdiff': 1e-6, 'inner_maxiter': 100, 
-                                             'inner_inner_m': inner_m, 'inner_tol': tolnormt * 0.5,
-                                             'outer_k': outer_k, 'inner_M': M}
+                             'jac_options': jac_options
                             })
     else:
         raise ValueError
