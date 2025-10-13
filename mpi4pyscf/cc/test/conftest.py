@@ -8,7 +8,7 @@ def H2O_mol():
         [8 , (0. , 0.     , 0.)],
         [1 , (0. , -0.757 , 0.587)],
         [1 , (0. , 0.757  , 0.587)]]
-    mol.basis = 'cc-pvdz'
+    mol.basis = 'cc-pvtz'
     mol.spin = 0
     mol.build()
     return mol

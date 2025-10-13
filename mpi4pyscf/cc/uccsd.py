@@ -1,5 +1,9 @@
 """
 MPI-parallelized UCCSD with real integrals.
+
+
+TODO: The amp->vector is not the most efficient way to compress (only oo/OO part)
+Author: Shuoxue Li <sli7@caltech.edu>
 """
 import gc
 
@@ -60,9 +64,9 @@ def einsum_sz(subscripts: str, arr1: SegArray, arr2: SegArray,
     if out is not None:
         seg_idxs += (out.seg_idx, )        
 
-    if rank == 0 and debug:
-        arr1_label = '_tmp' if arr1.label == '' else arr1.label
-        arr2_label = '_tmp' if arr2.label == '' else arr2.label
+    # if rank == 0 and debug:
+        # arr1_label = '_tmp' if arr1.label == '' else arr1.label
+        # arr2_label = '_tmp' if arr2.label == '' else arr2.label
         # print(f"[uccsd.update_amps] einsum('{subscripts}', {arr1_label}, {arr2_label}) ...")
     final_data, final_seg_idx = tools.segmented_einsum_new(
         subscripts=subscripts,
