@@ -358,10 +358,11 @@ def get_res(mycc, x):
 
     # then gather the vector
     res = mycc.amplitudes_to_vector(t1, t2)
-    precond_vec = mycc.distribute_vector_(mycc.precond_vec, write=None)
 
     # Shuoxue NOTE: get the t(ite-rk) from t(new);t(old) by t1(new) = [t1(ite-rk) + t1(old) * eIA] / eIA
-    res = (res - vec) * precond_vec
+    # Shuoxue NOTE: This part has already been included in update_amps by checking whether mycc.rk exists
+    # precond_vec = mycc.distribute_vector_(mycc.precond_vec, write=None)
+    # res = (res - vec) * precond_vec
 
     norm = safe_max_abs(res)
     norm = comm.allreduce(norm, op=mpi.MPI.MAX)

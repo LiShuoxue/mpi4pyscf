@@ -269,7 +269,7 @@ def make_intermediates(cc, t1, t2, eris, checkpoint: int | None = None):
     # pyscf L170-L187
     # v4ovxo += _einsum('jbld,kd,lc->jbck', oxov, t1a, -t1a)
     tmp = _einsum("jbld,kd->jblk", oxov, t1a)
-    print(f"tmp.seg_spin = {tmp.seg_spin} oxov.seg_spin = {oxov.seg_spin}")
+    # print(f"tmp.seg_spin = {tmp.seg_spin} oxov.seg_spin = {oxov.seg_spin}")
     v4ovxo += _einsum('jblk,lc->jbck', tmp, -t1_ox.set(seg_spin=0), out=v4ovxo)
     # v4OVXO += _einsum('jbld,kd,lc->jbck', OXOV, t1b, -t1b)
     v4OVXO += _einsum("jblk,lc->jbck", _einsum("jbld,kd->jblk", OXOV, t1b), -t1_OX)
@@ -421,6 +421,7 @@ def make_intermediates(cc, t1, t2, eris, checkpoint: int | None = None):
 def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
                   return_segarray: bool = False):
     log = logger.Logger(cc.stdout, cc.verbose)
+    rk = getattr(cc, 'rk', False)   # Whether use ITE update or not
 
     debug = (cc.verbose >= logger.DEBUG2)
 
@@ -511,10 +512,17 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
 
     fova = eris.focka[:nocca, nocca:]
     fovb = eris.fockb[:noccb, noccb:]
-    v1a = imds.v1a - np.diag(mo_ea_v)
-    v1b = imds.v1b - np.diag(mo_eb_v)
-    v2a = imds.v2a - np.diag(mo_ea_o)
-    v2b = imds.v2b - np.diag(mo_eb_o)
+
+    if rk:
+        v1a = imds.v1a - np.zeros_like(imds.v1a.data)
+        v1b = imds.v1b - np.zeros_like(imds.v1b.data)
+        v2a = imds.v2a - np.zeros_like(imds.v2a.data)
+        v2b = imds.v2b - np.zeros_like(imds.v2b.data)
+    else:
+        v1a = imds.v1a - np.diag(mo_ea_v)
+        v1b = imds.v1b - np.diag(mo_eb_v)
+        v2a = imds.v2a - np.diag(mo_ea_o)
+        v2b = imds.v2b - np.diag(mo_eb_o)
 
     mvv  = _einsum('klca,klcb->ba', l2_ooxv, t2_ooxv).collect().set(label='mvv') * .5
     mvv += _einsum('lKaC,lKbC->ba', l2_oOxV, t2_oOxV).collect() # [a],[b]->ab
@@ -828,12 +836,13 @@ def update_lambda(cc, t1, t2, l1, l2, eris, imds, checkpoint: int | None = None,
 
     u1a = (u1a0 + u1_ox) + u1a
     u1b = (u1b0 + u1_OX) + u1b
-    u1a /= eia
-    u1b /= eIA
 
-    u2_ooxv /= lib.direct_sum('ia+jb->ijab', eia[:, slc_va], eia)
-    u2_oOxV /= lib.direct_sum('ia+jb->ijab', eia[:, slc_va], eIA)
-    u2_OOXV /= lib.direct_sum('ia+jb->ijab', eIA[:, slc_vb], eIA)
+    if not rk:
+        u1a /= eia
+        u1b /= eIA
+        u2_ooxv /= lib.direct_sum('ia+jb->ijab', eia[:, slc_va], eia)
+        u2_oOxV /= lib.direct_sum('ia+jb->ijab', eia[:, slc_va], eIA)
+        u2_OOXV /= lib.direct_sum('ia+jb->ijab', eIA[:, slc_vb], eIA)
 
     if checkpoint == 36:
         return dict(u1a=u1a.data, u1b=u1b.data,

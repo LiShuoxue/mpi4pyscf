@@ -127,8 +127,10 @@ def get_lambda_res(mycc, x):
 
     # then gather the vector
     res = mycc.amplitudes_to_vector(l1, l2)
-    precond_vec = mycc.distribute_vector_(mycc.precond_vec, write=None)
-    res = (res - vec) * precond_vec
+
+    # Shuoxue NOTE: already included in update_amps by checking whether mycc.rk exists
+    # precond_vec = mycc.distribute_vector_(mycc.precond_vec, write=None)
+    # res = (res - vec) * precond_vec
 
     norm = safe_max_abs(res)
     norm = comm.allreduce(norm, op=mpi.MPI.MAX)
@@ -151,7 +153,6 @@ def kernel(mycc):
     tolnormt = mycc.conv_tol_normt
     max_cycle = mycc.max_cycle
     vec_size = mycc.vec.size
-    
     if mycc.precond is None:
         M = None
     else:

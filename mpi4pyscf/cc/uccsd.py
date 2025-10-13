@@ -203,21 +203,6 @@ def vector_to_amplitudes(vector, nmo, nocc):
     t2_XVOO = lib.unpack_tril(t2bb_tril.reshape(nvirb_seg * nvirb, noccb_pair), filltriu=lib.ANTIHERMI)
     t2_XVOO = t2_XVOO.reshape(nvirb_seg, nvirb, noccb, noccb)
 
-    # (idxa, idya), (idxb, idyb) = map(np.tril_indices, (nocca, noccb))
-    # t2_xvoo -= t2_xvoo.transpose(0, 1, 3, 2)
-    # t2_XVOO -= t2_XVOO.transpose(0, 1, 3, 2)
-
-    """
-    t2aa_tmp = mpi.alltoall_new([t2aa_tril[:, p0:p1] for p0, p1 in vlocsa], split_recvbuf=True)
-    t2bb_tmp = mpi.alltoall_new([t2bb_tril[:, p0:p1] for p0, p1 in vlocsb], split_recvbuf=True)
-    for task_id, (p0, p1) in enumerate(vlocsa):
-        tmp = t2aa_tmp[task_id].reshape(nvira_seg, p1 - p0, nocca_pair)
-        t2_xvoo[:, p0:p1, idya, idxa] = - tmp.transpose(1, 0, 2)
-    for task_id, (p0, p1) in enumerate(vlocsb):
-        tmp = t2bb_tmp[task_id].reshape(p1 - p0, nvirb_seg, noccb_pair)
-        t2_XVOO[:, p0:p1, idyb, idxb] = - tmp.transpose(1, 0, 2)
-    """
-
     return (t1a, t1b), (t2_xvoo.transpose(2, 3, 0, 1), t2_oOxV, t2_XVOO.transpose(2, 3, 0, 1))
 
 
@@ -310,7 +295,6 @@ def make_tau(t2, t1, r1, vlocs=None, fac=1., out=None):
     else:
         vlocsa, vlocsb = vlocs
 
-    # print(f"rank = {rank} , shapes: t2_ooxv: {t2_ooxv.shape}, t2_oOxV: {t2_oOxV.shape}, t2_OOXV: {t2_OOXV.shape}")
     tau_ooxv = make_tau_aa(t2_ooxv, t1a, r1a, vlocs=vlocsa, fac=fac, out=out)
     tau_OOXV = make_tau_aa(t2_OOXV, t1b, r1b, vlocs=vlocsb, fac=fac, out=out)
     tau_oOxV = make_tau_ab(t2_oOxV, t1, r1, vlocsa=vlocsa, fac=fac, out=out)
@@ -686,6 +670,8 @@ def _make_eris_incore_uihf(mycc, mo_coeff=None, ao2mofn=None):
 
 def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
 
+    rk = getattr(cc, 'rk', False)   # Whether use ITE update or not
+
     log = logger.Logger(cc.stdout, cc.verbose)
 
     debug = (cc.verbose >= logger.DEBUG2)
@@ -724,10 +710,18 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
     Foob_0 =  .5 * lib.einsum('me,ie->mi', fovb, t1b)
     Fvva_0 = -.5 * lib.einsum('me,ma->ae', fova, t1a)
     Fvvb_0 = -.5 * lib.einsum('me,ma->ae', fovb, t1b)
-    Fooa_0 += eris.focka[:nocca,:nocca] - np.diag(mo_ea_o)
-    Foob_0 += eris.fockb[:noccb,:noccb] - np.diag(mo_eb_o)
-    Fvva_0 += eris.focka[nocca:,nocca:] - np.diag(mo_ea_v)
-    Fvvb_0 += eris.fockb[noccb:,noccb:] - np.diag(mo_eb_v)
+
+    if rk:
+        Fooa_0 += eris.focka[:nocca,:nocca]
+        Foob_0 += eris.fockb[:noccb,:noccb]
+        Fvva_0 += eris.focka[nocca:,nocca:]
+        Fvvb_0 += eris.fockb[noccb:,noccb:]
+    else:
+        Fooa_0 += eris.focka[:nocca,:nocca] - np.diag(mo_ea_o)
+        Foob_0 += eris.fockb[:noccb,:noccb] - np.diag(mo_eb_o)
+        Fvva_0 += eris.focka[nocca:,nocca:] - np.diag(mo_ea_v)
+        Fvvb_0 += eris.fockb[noccb:,noccb:] - np.diag(mo_eb_v)
+
     Fova_0 = fova.copy()
     Fovb_0 = fovb.copy()
     u1a_0 = np.zeros_like(t1a)
@@ -737,20 +731,6 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
 
     u2_ooxv, u2_oOxV, u2_OOXV = _add_vvvv(t1=None, t2=taus, eris=eris, vlocs=vlocs_ab, max_memory=cc.max_memory)
     tau_ooxv, tau_oOxV, tau_OOXV = taus
-
-    """
-    tau_aa = tools.collect_array(tau_ooxv, seg_idx=2, bcast=False)
-    tau_bb = tools.collect_array(tau_OOXV, seg_idx=2, bcast=False)
-    tau_ab = tools.collect_array(tau_oOxV, seg_idx=2, bcast=False)
-    # print(f"tau_aa.shape = {tau_aa.shape}, tau_ab.shape = {tau_ab.shape}, tau_bb.shape = {tau_bb.shape}")
-    if rank == 0:
-        u2_aa, u2_ab, u2_bb = cc._add_vvvv(None, (tau_aa, tau_ab, tau_bb), eris)
-    tau_aa = tau_bb = tau_ab = None
-    u2_ooxv = tools.get_mpi_array(lambda: u2_aa, vlocs=vlocs_a, seg_idx=2)
-    u2_OOXV = tools.get_mpi_array(lambda: u2_bb, vlocs=vlocs_b, seg_idx=2)
-    u2_oOxV = tools.get_mpi_array(lambda: u2_ab, vlocs=vlocs_a, seg_idx=2)
-    u2_aa = u2_bb = u2_ab = None
-    """
 
     u2_ooxv *= .5
     u2_OOXV *= .5
@@ -1121,12 +1101,12 @@ def update_amps(cc, t1, t2, eris, checkpoint: int | None = None):
     u1a = u1a_0 + u1a.collect() + u1_ox.collect()
     u1b = u1b_0 + u1b.collect() + u1_OX.collect()
 
-    u1a /= eia_a
-    u1b /= eia_b
-
-    u2_ooxv /= lib.direct_sum('ia+jb->ijab', eia_a[:, slc_va], eia_a)
-    u2_oOxV /= lib.direct_sum('ia+jb->ijab', eia_a[:, slc_va], eia_b)
-    u2_OOXV /= lib.direct_sum('ia+jb->ijab', eia_b[:, slc_vb], eia_b)
+    if not rk:
+        u1a /= eia_a
+        u1b /= eia_b
+        u2_ooxv /= lib.direct_sum('ia+jb->ijab', eia_a[:, slc_va], eia_a)
+        u2_oOxV /= lib.direct_sum('ia+jb->ijab', eia_a[:, slc_va], eia_b)
+        u2_OOXV /= lib.direct_sum('ia+jb->ijab', eia_b[:, slc_vb], eia_b)
 
     t1new = (u1a.data, u1b.data)
     t2new = (u2_ooxv.data, u2_oOxV.data, u2_OOXV.data)
@@ -1194,7 +1174,6 @@ def energy(cc, t1=None, t2=None, eris=None):
 
 @mpi.parallel_call(skip_args=[1, 2], skip_kwargs=['t1', 't2'])
 def distribute_amplitudes_(mycc, t1=None, t2=None):
-    print(f"rank = {rank}, type(t1) = {type(t1)}, type(t2) = {type(t2)}")
 
     _sync_(mycc)
     nvira = mycc.nmo[0] - mycc.nocc[0]

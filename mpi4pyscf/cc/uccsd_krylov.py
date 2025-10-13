@@ -89,11 +89,12 @@ class UICCSD_KRYLOV(mpi_uccsd.UICCSD):
                  method='krylov', precond='finv', inner_m=10, outer_k=6,
                  frozen_abab=False, nocc_a=None, nvir_a=None):
         pyscf_uccsd.UCCSD.__init__(self, mf, frozen, mo_coeff, mo_occ)
+        self.rk = True
         self.method = method
         self.precond = precond
         self.inner_m = inner_m
         self.outer_k = outer_k
-        self._keys = self._keys.union(["method", "precond", "inner_m", "outer_k"])
+        self._keys = self._keys.union(["method", "precond", "inner_m", "outer_k", 'rk'])
         regs = mpi.pool.apply(_init_uiccsd_krylov, (self, ), (None, ))
         self._reg_procs = regs
 
@@ -104,13 +105,14 @@ class UICCSD_KRYLOV(mpi_uccsd.UICCSD):
             logger.info(self, "precond = %s", self.precond)
             logger.info(self, "inner_m = %d", self.inner_m)
             logger.info(self, "outer_k = %d", self.outer_k)
+            logger.info(self, "rk      = %s", self.rk)
         return self
 
     def pack(self):
         packed_args = ('verbose', 'max_memory', 'frozen', 'mo_coeff', 'mo_occ',
                        '_nocc', '_nmo', 'diis_file', 'diis_start_cycle',
                        'level_shift', 'direct', 'diis_space',
-                       'method', 'precond', 'inner_m', 'outer_k')
+                       'method', 'precond', 'inner_m', 'outer_k', 'rk')
         return {arg: getattr(self, arg) for arg in packed_args} 
 
     def ccsd(self, t1=None, t2=None, eris=None):
