@@ -149,6 +149,9 @@ def kernel(mycc):
     """
     Krylov kernel.
     """
+    time0 = (logger.process_clock(), logger.perf_counter())
+    log = logger.Logger(mycc.stdout, mycc.verbose)
+
     froot = opt.root
     tolnormt = mycc.conv_tol_normt
     max_cycle = mycc.max_cycle
@@ -193,6 +196,8 @@ def kernel(mycc):
     release_imds(mycc)
     conv = res.success
     mycc.distribute_vector_(res.x, write='l')
+
+    time0 = log.timer('LAMBDA(KRYLOV, MPI)', *time0)
     return conv, mycc.l1, mycc.l2
 
 if __name__ == '__main__':

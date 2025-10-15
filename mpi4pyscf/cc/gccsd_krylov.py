@@ -391,6 +391,9 @@ def kernel(mycc):
     """
     Krylov kernel.
     """
+    time0 = (logger.process_clock(), logger.perf_counter())
+    log = logger.Logger(mycc.stdout, mycc.verbose)
+
     froot = opt.root
     tolnormt = mycc.conv_tol_normt
     max_cycle = mycc.max_cycle
@@ -434,7 +437,10 @@ def kernel(mycc):
     mycc.distribute_vector_(res.x, write='t')
     eccsd = mycc.energy()
     mycc.e_corr = eccsd
+
+    time0 = log.timer('CCSD(KRYLOV, MPI)', *time0)
     return conv, eccsd, mycc.t1, mycc.t2
+
 
 def _init_ggccsd_krylov(ccsd_obj):
     from pyscf import gto

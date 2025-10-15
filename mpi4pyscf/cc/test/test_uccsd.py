@@ -515,6 +515,7 @@ def test_restore(mf: UIHF):
 
 
 if __name__ == "__main__":
+    # mpirun -np 4 python test_uccsd.py init_amps
     from mpi4pyscf.cc.test.conftest import H2O_mol, H2O_trimer_mol, H2O_dimer_mol
     import sys
 

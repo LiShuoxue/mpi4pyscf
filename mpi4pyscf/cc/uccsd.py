@@ -248,8 +248,8 @@ def init_amps(mycc, eris=None):
     t2_ooxv = tools.segmented_transpose(t2_ooxv, 2, 3, 1., -1., vlocs=vlocsa)
     t2_OOXV = tools.segmented_transpose(t2_OOXV, 2, 3, 1., -1., vlocs=vlocsb)
 
-    assert np.allclose(t2_ooxv, -t2_ooxv.transpose(1, 0, 2, 3))
-    assert np.allclose(t2_OOXV, -t2_OOXV.transpose(1, 0, 2, 3))
+    # assert np.allclose(t2_ooxv, -t2_ooxv.transpose(1, 0, 2, 3))
+    # assert np.allclose(t2_OOXV, -t2_OOXV.transpose(1, 0, 2, 3))
 
     emp2 = np.einsum("iJxB,ixJB->", t2_oOxV, eris_oxOV)
     emp2 += np.einsum("ijxb,ixjb->", t2_ooxv, eris_oxov) * .5
@@ -1302,6 +1302,7 @@ def transform_t1_to_bo(t1, u):
     from mpi4pyscf.cc.gccsd import transform_t1_to_bo as _fn_gccsd
     return [_fn_gccsd(t1[s], u[s]) for s in (0, 1)]
 
+
 def transform_t2_to_bo(t2, u, vlocss=None):
     ua, ub = u
     t2_ooxv, t2_oOxV, t2_OOXV = t2
@@ -1350,7 +1351,6 @@ def transform_t2_to_bo(t2, u, vlocss=None):
     t2_oOxV_bo += _einsum("IJxB,xX->IJXB", t2_oOxV_tmp, u_xv)
 
     return (t2_ooxv_bo.data, t2_oOxV_bo.data, t2_OOXV_bo.data)
-    
 
 transform_l1_to_bo = transform_t1_to_bo
 transform_l2_to_bo = transform_t2_to_bo

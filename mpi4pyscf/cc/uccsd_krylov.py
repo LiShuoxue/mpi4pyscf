@@ -7,7 +7,7 @@ from mpi4pyscf.cc import gccsd_krylov as mpi_gccsd_krylov
 
 from mpi4pyscf.lib import logger
 from mpi4pyscf.tools import mpi
-from mpi4pyscf.cc.ccsd import _sync_, _pack_scf, _task_location
+from mpi4pyscf.cc.ccsd import _pack_scf
 from mpi4pyscf.cc import uccsd as mpi_uccsd
 from mpi4pyscf.cc import cc_tools as tools
 
