@@ -223,9 +223,9 @@ def init_amps(mycc, eris=None):
     fova = eris.focka[:nocca,nocca:]
     fovb = eris.fockb[:noccb,noccb:]
     mo_ea_o = eris.mo_energy[0][:nocca]
-    mo_ea_v = eris.mo_energy[0][nocca:]
+    mo_ea_v = eris.mo_energy[0][nocca:] + mycc.level_shift
     mo_eb_o = eris.mo_energy[1][:noccb]
-    mo_eb_v = eris.mo_energy[1][noccb:]
+    mo_eb_v = eris.mo_energy[1][noccb:] + mycc.level_shift
     eia_a = lib.direct_sum('i-a->ia', mo_ea_o, mo_ea_v)
     eia_b = lib.direct_sum('i-a->ia', mo_eb_o, mo_eb_v)
 
