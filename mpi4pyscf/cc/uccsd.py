@@ -1325,11 +1325,11 @@ def transform_t2_to_bo(t2, u, vlocss=None):
     umat_vir_a, umat_vir_b = ua[nocc_a:, nocc_a:], ub[nocc_b:, nocc_b:]
 
     t2_ooxv_tmp = np.einsum("ijxb,iI,jJ,bB->IJxB", t2_ooxv,
-                            umat_occ_a, umat_occ_a, umat_vir_a)
+                            umat_occ_a, umat_occ_a, umat_vir_a, optimize=True)
     t2_OOXV_tmp = np.einsum("ijxb,iI,jJ,bB->IJxB", t2_OOXV,
-                            umat_occ_b, umat_occ_b, umat_vir_b)
+                            umat_occ_b, umat_occ_b, umat_vir_b, optimize=True)
     t2_oOxV_tmp = np.einsum("ijxb,iI,jJ,bB->IJxB", t2_oOxV,
-                            umat_occ_a, umat_occ_b, umat_vir_b)
+                            umat_occ_a, umat_occ_b, umat_vir_b, optimize=True)
 
     t2_ooxv_tmp = SegArray(t2_ooxv_tmp, seg_idx=2, seg_spin=0, label='t2aa_tmp')
     t2_OOXV_tmp = SegArray(t2_OOXV_tmp, seg_idx=2, seg_spin=1, label='t2bb_tmp')
